@@ -1,0 +1,2258 @@
+#!/usr/bin/env python3
+"""
+【主版本】基于LangChain官方create_agent实现 - 参考EchoMind架构
+✅  内置工具调用限制，解决递归死循环问题
+✅  性能优异，智能性更高
+✅  完全兼容原有接口
+"""
+
+import os
+import json
+import re
+import subprocess
+import asyncio
+from datetime import datetime
+from typing import List, Tuple, Dict, Any, Optional, Callable, Awaitable, AsyncGenerator
+from langchain_core.tools import StructuredTool
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.text import Text
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk, ToolMessage, RemoveMessage
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_openai import ChatOpenAI
+from .memory import LongTermMemory
+from langchain.agents.middleware import ModelCallLimitMiddleware, SummarizationMiddleware, wrap_tool_call
+from langchain.agents.middleware.types import AgentMiddleware, ModelResponse
+from langchain_core.messages.utils import count_tokens_approximately
+from .config import (
+    MAX_ITERATIONS,
+    RECURSION_LIMIT,
+    MAX_CONTEXT_TOKENS,
+    SKILLS_DIR,
+    SKILL_FILE_NAMES,
+    TERMUX_API_CHECK_CMD,
+    TERMUX_API_INSTALL_GUIDE,
+    ENV_LIGHT_SENSOR_CMD,
+    ENV_ACCEL_SENSOR_CMD,
+    ENV_TIME_CMD,
+    ENV_TIMEZONE_CMD,
+    PROJECT_ROOT,
+    TASKS_DIR,
+    LOGS_DIR,
+    EXECUTOR_SKILLS_DIR,
+    AUTO_SKILLS_DIR,
+    EXECUTOR_LLM_CONFIG,
+)
+from .prompts.agent_enhance import prompt as agent_enhance_prompt
+from .logger import AgentLogger
+from .tools.basic_tools import ALL_TOOLS, set_memory_instance, consume_pending_tasks, set_current_conversation_id, _fts_search, _vector_search, _rrf_merge
+from .prompts.executor_system import executor_system_prompt
+from .prompts.executor_enhance import prompt as executor_enhance_prompt
+from pocket_agent import get_runtime_services
+from pocket_agent.agents import ExecutionVerifier
+from pocket_agent.runtime import RunStatus, set_conversation_id, set_run_id
+from pocket_agent.skills import SkillCurator, VerificationEvidence
+
+
+# ── 技能加载工具 ──────────────────────────────────────────────
+def _read_skill_desc(skill_path: str) -> str:
+    """读取SKILL.md前20行中的description字段"""
+    try:
+        with open(skill_path, 'r', encoding='utf-8') as f:
+            for _ in range(20):
+                line = f.readline()
+                if not line:
+                    break
+                if line.startswith("description:"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _scan_skills(scan_dir: str) -> list:
+    """
+    扫描指定目录下的所有技能，支持单层嵌套分类。
+    返回 (category_name, skill_name, desc, skill_path) 元组列表。
+    - 如果子目录直接含 SKILL.md → flat 模式，category_name 为空
+    - 如果子目录含再下一级子目录有 SKILL.md → category 模式
+    """
+    results = []
+    for entry in sorted(os.listdir(scan_dir)):
+        entry_path = os.path.join(scan_dir, entry)
+        if not os.path.isdir(entry_path):
+            continue
+
+        # 检查 entry 是否直接是技能（含 SKILL.md）
+        skill_file = None
+        for fn in SKILL_FILE_NAMES:
+            candidate = os.path.join(entry_path, fn)
+            if os.path.exists(candidate):
+                skill_file = candidate
+                break
+
+        if skill_file:
+            desc = _read_skill_desc(skill_file)
+            results.append(("", entry, desc, skill_file))
+            continue
+
+        # 否则检查 entry 下的子目录是否有技能（category 模式）
+        sub_skills = []
+        for sub_entry in sorted(os.listdir(entry_path)):
+            sub_path = os.path.join(entry_path, sub_entry)
+            if not os.path.isdir(sub_path):
+                continue
+            for fn in SKILL_FILE_NAMES:
+                candidate = os.path.join(sub_path, fn)
+                if os.path.exists(candidate):
+                    desc = _read_skill_desc(candidate)
+                    sub_skills.append((sub_entry, desc, candidate))
+                    break
+
+        if sub_skills:
+            for name, desc, skill_path in sub_skills:
+                results.append((entry, name, desc, skill_path))
+
+    return results
+
+
+def _executor_skill_entries(skills: list) -> list:
+    auto_dir = os.path.join(AUTO_SKILLS_DIR, "executor")
+    if os.path.exists(auto_dir):
+        skills.extend(_scan_skills(auto_dir))
+    active = get_runtime_services().skills.list("active")
+    active_ids = {s["id"] for s in active}
+    skills = [entry for entry in skills if entry[1] not in active_ids]
+    skills.extend(("verified", s["id"], s["description"], s["content_path"]) for s in active)
+    return skills
+
+
+def load_skills_list(agent_type: str = "main") -> str:
+    """
+    根据agent类型加载对应技能列表
+    Args:
+        agent_type: "main" → main-skills/ 目录, "executor" → executor-skills/ + auto-skills/executor/
+    """
+    skills_dir = SKILLS_DIR if agent_type == "main" else EXECUTOR_SKILLS_DIR
+
+    if not os.path.exists(skills_dir) and agent_type != "executor":
+        return "暂无可用技能。"
+
+    skills = _scan_skills(skills_dir) if os.path.exists(skills_dir) else []
+
+    # executor 额外加载自动沉淀技能，和主Agent统一写法
+    if agent_type == "executor":
+        skills = _executor_skill_entries(skills)
+
+    if not skills:
+        return "暂无可用技能。"
+
+    # 按分类分组输出
+    categories = {}
+    for cat, name, desc, skill_path in skills:
+        categories.setdefault(cat, []).append((name, desc, skill_path))
+
+    lines = []
+    for cat, skill_list in categories.items():
+        if cat:
+            lines.append(f"\n【{cat}】")
+        for name, desc, skill_path in skill_list:
+            entry = f"- {name}: {desc}（路径：{skill_path}）" if desc else f"- {name}（路径：{skill_path}）"
+            lines.append(entry)
+        if not cat:
+            lines.append("")  # 空行分隔无分类和有分类
+
+    skills_text = "\n".join(lines).strip()
+    # 用第一个技能的实际路径作为示例
+    first_path = skills[0][3] if skills else ""
+    if not first_path:
+        first_path = os.path.join(skills_dir, "example", "SKILL.md")
+    usage_note = f"\n\n使用说明：需要使用某个技能时，用file_read读取对应SKILL.md即可，例如：file_read(filepath='{first_path}')"
+
+    return skills_text + usage_note
+
+
+def load_skills_for_completer(agent_type: str = "main") -> tuple:
+    """返回 (skill_names_list, skill_descriptions_dict, skill_info_dict) 供自动补全使用"""
+    skills_dir = SKILLS_DIR if agent_type == "main" else EXECUTOR_SKILLS_DIR
+    if not os.path.exists(skills_dir) and agent_type != "executor":
+        return [], {}, {}
+    skills = _scan_skills(skills_dir) if os.path.exists(skills_dir) else []
+    if agent_type == "executor":
+        skills = _executor_skill_entries(skills)
+    names = [s[1] for s in skills]
+    descs = {s[1]: s[2] for s in skills if s[2]}
+    info = {s[1]: {"category": s[0], "path": s[3], "desc": s[2]} for s in skills}
+    return names, descs, info
+
+
+# ── 工具初始化 ──────────────────────────────────────────────
+# 从basic_tools导入的ALL_TOOLS已经是@tool装饰的函数，直接使用即可
+
+
+
+
+# ── DeepSeek reasoning_content 兼容补丁 ──────────────────────────────
+# LangChain 的 ChatOpenAI 不支持非标准 API 字段（文档写明），导致：
+# 1. 流式响应中的 reasoning_content 被 _convert_delta_to_message_chunk 丢弃
+# 2. additional_kwargs 中的字段不被 _convert_message_to_dict 传回 API
+# 两处 monkey-patch 确保 reasoning_content 在请求-响应周期中完整保留。
+import langchain_openai.chat_models.base as _chat_base
+
+# Patch 1: 流式响应中捕获 reasoning_content 存入 additional_kwargs
+_original_convert_delta = _chat_base._convert_delta_to_message_chunk
+
+def _patched_convert_delta(_dict, default_class):
+    chunk = _original_convert_delta(_dict, default_class)
+    if isinstance(chunk, AIMessageChunk):
+        rc = _dict.get("reasoning_content")
+        if rc:
+            chunk.additional_kwargs["reasoning_content"] = rc
+    return chunk
+
+_chat_base._convert_delta_to_message_chunk = _patched_convert_delta
+
+# Patch 2: 发送消息时把 additional_kwargs 中的 reasoning_content 传给 API
+_original_convert = _chat_base._convert_message_to_dict
+
+def _patched_convert_message_to_dict(message, api="chat/completions"):
+    result = _original_convert(message, api)
+    if isinstance(message, AIMessage):
+        for key in ('reasoning_content',):
+            if key in message.additional_kwargs:
+                result[key] = message.additional_kwargs[key]
+    return result
+
+_chat_base._convert_message_to_dict = _patched_convert_message_to_dict
+# ──────────────────────────────────────────────────────────────────────
+
+
+# ── 工具调用ID修复中间件 ──────────────────────────────────────────────
+# 某些LLM（如GLM系列）生成的tool_call缺少id字段，
+# 导致LangGraph的ToolNode创建ToolMessage时tool_call_id为空报错
+import uuid
+
+
+class ToolCallRepeatMiddleware(AgentMiddleware):
+    """检测连续重复的工具调用，第二次重复时返回警告，让模型自我纠正"""
+
+    def __init__(self):
+        self._last_tool_call = None  # (name, args_json)
+
+    def wrap_tool_call(self, request, handler):
+        tool_call = request.tool_call
+        name = tool_call.get("name", "")
+        args = tool_call.get("args", {})
+        args_json = json.dumps(args, sort_keys=True, ensure_ascii=False)
+
+        # 检测是否与上一次调用完全相同
+        if self._last_tool_call and self._last_tool_call == (name, args_json):
+            # 重复调用，返回警告而不是执行
+            return ToolMessage(
+                content=f"⚠️ 你刚刚已经调用过 {name}({args_json[:100]}) 并且得到了结果，请勿重复调用。请基于已有结果继续下一步操作。",
+                tool_call_id=tool_call.get("id", ""),
+                name=name,
+            )
+
+        # 不是重复，正常执行并记录
+        result = handler(request)
+        self._last_tool_call = (name, args_json)
+        return result
+
+    async def awrap_tool_call(self, request, handler):
+        tool_call = request.tool_call
+        name = tool_call.get("name", "")
+        args = tool_call.get("args", {})
+        args_json = json.dumps(args, sort_keys=True, ensure_ascii=False)
+
+        # 检测是否与上一次调用完全相同
+        if self._last_tool_call and self._last_tool_call == (name, args_json):
+            # 重复调用，返回警告而不是执行
+            return ToolMessage(
+                content=f"⚠️ 你刚刚已经调用过 {name}({args_json[:100]}) 并且得到了结果，请勿重复调用。请基于已有结果继续下一步操作。",
+                tool_call_id=tool_call.get("id", ""),
+                name=name,
+            )
+
+        # 不是重复，正常执行并记录
+        result = await handler(request)
+        self._last_tool_call = (name, args_json)
+        return result
+
+
+class ToolCallIdMiddleware(AgentMiddleware):
+    """确保所有工具调用都有有效的id字段"""
+
+    def wrap_model_call(self, request, handler):
+        response = handler(request)
+        return self._fix_tool_call_ids(response)
+
+    async def awrap_model_call(self, request, handler):
+        response = await handler(request)
+        return self._fix_tool_call_ids(response)
+
+    def _fix_tool_call_ids(self, response):
+        result = list(response.result)
+        modified = False
+        for i, msg in enumerate(result):
+            if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+                fixed_calls = []
+                for tc in msg.tool_calls:
+                    if not tc.get("id") or not isinstance(tc["id"], str) or tc["id"] == "":
+                        tc = dict(tc)
+                        tc["id"] = f"call_{uuid.uuid4().hex[:12]}"
+                        fixed_calls.append(tc)
+                        modified = True
+                    else:
+                        fixed_calls.append(tc)
+                if modified:
+                    result[i] = AIMessage(
+                        content=msg.content,
+                        tool_calls=fixed_calls,
+                        additional_kwargs=msg.additional_kwargs,
+                        response_metadata=msg.response_metadata,
+                        id=msg.id,
+                    )
+        if modified:
+            return ModelResponse(result=result, structured_response=response.structured_response)
+        return response
+
+
+class ImageOptimizationMiddleware(AgentMiddleware):
+    """优化多模态消息中的图片内容，避免图片base64数据累积导致token溢出"""
+
+    def wrap_model_call(self, request, handler):
+        # 处理请求中的历史消息，移除所有图片base64数据
+        self._remove_image_content(request.messages)
+        response = handler(request)
+        return response
+
+    async def awrap_model_call(self, request, handler):
+        # 处理请求中的历史消息，移除所有图片base64数据
+        self._remove_image_content(request.messages)
+        response = await handler(request)
+        return response
+
+    def _remove_image_content(self, messages):
+        """
+        移除所有消息中的图片base64数据，替换为文本描述
+        彻底避免图片数据累积导致token溢出
+        """
+        import re
+        for msg in messages:
+            if hasattr(msg, 'content'):
+                # 处理纯文本格式，移除Markdown图片的base64
+                if isinstance(msg.content, str):
+                    content = msg.content
+                    # 匹配Markdown图片格式：![alt](data:image/...;base64,...)
+                    markdown_img_pattern = r'!\[.*?\]\(data:image/[^)]+\)'
+                    if re.search(markdown_img_pattern, content):
+                        # 把图片替换为文本描述
+                        msg.content = re.sub(markdown_img_pattern, '[截图已保存]', content).strip()
+
+                # 处理多模态列表格式，移除图片数据
+                if isinstance(msg.content, list):
+                    optimized_content = []
+                    for item in msg.content:
+                        if isinstance(item, dict):
+                            # 处理OpenAI格式image_url类型
+                            if item.get("type") == "image_url":
+                                # 图片替换为文本
+                                optimized_content.append({
+                                    "type": "text",
+                                    "text": "[截图已保存]"
+                                })
+                            # 处理MCP标准image类型
+                            elif item.get("type") == "image":
+                                # 图片替换为文本
+                                optimized_content.append({
+                                    "type": "text",
+                                    "text": "[截图已保存]"
+                                })
+                            else:
+                                optimized_content.append(item)
+                        else:
+                            optimized_content.append(item)
+                    msg.content = optimized_content
+
+
+class MCPToolResultMiddleware(AgentMiddleware):
+    """处理MCP工具返回结果，特别是图片数据，转换为正确的多模态格式避免token爆炸"""
+
+    def _process_image_content(self, content):
+        """处理图片内容，避免大体积base64导致token超限"""
+        import json
+
+        # 处理多模态列表格式的内容
+        if isinstance(content, list):
+            has_image = False
+            image_info = {}
+            text_parts = []
+
+            for item in content:
+                if isinstance(item, dict):
+                    item_type = item.get('type')
+                    # 处理文本内容，保留
+                    if item_type == 'text' and 'text' in item:
+                        text_parts.append(item['text'])
+                    # 处理MCP标准image类型
+                    elif item_type == 'image' and 'data' in item:
+                        has_image = True
+                        image_data = item['data'].strip()
+                        image_size_kb = len(image_data) * 3 / 4 / 1024
+                        image_info['size_kb'] = round(image_size_kb, 2)
+                        if 'width' in item:
+                            image_info['width'] = item['width']
+                        if 'height' in item:
+                            image_info['height'] = item['height']
+                    # 处理OpenAI格式image_url类型
+                    elif item_type == 'image_url' and 'image_url' in item:
+                        url = item['image_url'].get('url', '')
+                        if url.startswith('data:image/') or url.startswith('/9j/') or url.startswith('iVBORw0KGgo'):
+                            has_image = True
+                            image_size_kb = len(url) * 3 / 4 / 1024
+                            image_info['size_kb'] = round(image_size_kb, 2)
+
+            if has_image:
+                # 先保留原有的文本内容
+                result = []
+                if text_parts:
+                    result.append("\n".join(text_parts))
+
+                # 添加图片描述
+                info_text = "✅ 已成功截取当前页面的截图"
+                if image_info:
+                    details = []
+                    if 'width' in image_info and 'height' in image_info:
+                        details.append(f"分辨率：{image_info['width']} x {image_info['height']}")
+                    if 'size_kb' in image_info:
+                        details.append(f"大小：{image_info['size_kb']} KB")
+                    details.append("格式：JPEG")
+                    if details:
+                        info_text += "，截图参数：\n- " + "\n- ".join(details)
+                info_text += "\n\n你可以直接查看生成的截图内容。如果需要分析图片内容，请明确说明。"
+                result.append(info_text)
+
+                return "\n\n".join(result)
+            return None
+
+        # 处理字符串格式的内容
+        if not isinstance(content, str) or not content.strip():
+            return None
+
+        content = content.strip()
+        is_image = False
+        image_info = {}
+
+        # 尝试解析JSON，检测是否是图片返回
+        try:
+            if content.startswith(('{', '[')):
+                data = json.loads(content)
+
+                # 情况1：MCP标准返回格式 {"content": [{"type": "image", "data": "base64"}]}
+                if isinstance(data, dict) and 'content' in data:
+                    content_list = data['content']
+                    if isinstance(content_list, list) and len(content_list) > 0:
+                        item = content_list[0]
+                        if isinstance(item, dict) and item.get('type') == 'image' and 'data' in item:
+                            is_image = True
+                            image_data = item['data'].strip()
+                            # 估算图片大小
+                            image_size_kb = len(image_data) * 3 / 4 / 1024
+                            image_info['size_kb'] = round(image_size_kb, 2)
+                            # 尝试提取分辨率信息（如果有）
+                            if 'width' in item:
+                                image_info['width'] = item['width']
+                            if 'height' in item:
+                                image_info['height'] = item['height']
+
+                # 情况2：其他JSON格式的图片返回
+                if not is_image and isinstance(data, dict):
+                    for key in ['image', 'screenshot', 'img', 'base64', 'data']:
+                        if key in data and isinstance(data[key], str):
+                            val = data[key].strip()
+                            if val.startswith('/9j/') or val.startswith('iVBORw0KGgo') or val.startswith('data:image/'):
+                                is_image = True
+                                image_size_kb = len(val) * 3 / 4 / 1024
+                                image_info['size_kb'] = round(image_size_kb, 2)
+                                break
+        except json.JSONDecodeError:
+            pass
+
+        # 情况3：纯文本base64图片
+        if not is_image:
+            if content.startswith("data:image/") or content.startswith('/9j/') or content.startswith('iVBORw0KGgo'):
+                is_image = True
+                image_size_kb = len(content) * 3 / 4 / 1024
+                image_info['size_kb'] = round(image_size_kb, 2)
+
+        if is_image:
+            # 【关键优化】不返回图片base64给LLM，直接返回文本描述
+            # 避免大体积图片导致token超限，LLM不需要看到图片二进制数据
+            info_text = "✅ 已成功截取当前页面的截图"
+            if image_info:
+                details = []
+                if 'width' in image_info and 'height' in image_info:
+                    details.append(f"分辨率：{image_info['width']} x {image_info['height']}")
+                if 'size_kb' in image_info:
+                    details.append(f"大小：{image_info['size_kb']} KB")
+                details.append("格式：JPEG")
+                if details:
+                    info_text += "，截图参数：\n- " + "\n- ".join(details)
+            info_text += "\n\n你可以直接查看生成的截图内容。如果需要分析图片内容，请明确说明。"
+
+            # 返回纯文本，不返回图片数据，彻底解决token超限问题
+            return info_text
+        return None
+
+    def wrap_tool_call(self, request, handler):
+        """同步版本的工具调用处理"""
+        result = handler(request)
+
+        # 处理ToolMessage中的图片内容
+        if isinstance(result, ToolMessage):
+            processed_content = self._process_image_content(result.content)
+            if processed_content is not None:
+                result.content = processed_content
+
+        return result
+
+    async def awrap_tool_call(self, request, handler):
+        """异步版本的工具调用处理"""
+        result = await handler(request)
+
+        # 处理ToolMessage中的图片内容
+        if isinstance(result, ToolMessage):
+            processed_content = self._process_image_content(result.content)
+            if processed_content is not None:
+                result.content = processed_content
+
+        return result
+
+
+# ── Agent 核心实现 ──────────────────────────────────────────────
+class LangChainPocketAgent:
+    """
+    基于LangChain官方create_agent实现的PocketAgent
+    参考EchoMind架构，内置工具调用限制，解决递归死循环问题
+    """
+
+    def __init__(
+        self,
+        system_prompt: str = "",
+        llm_config: Dict[str, Any] = None,
+        ui=None,
+        max_iterations: int = None,
+        checkpointer=None,
+        thread_id: str = None,
+    ):
+        self.ui = ui
+        self.base_system_prompt = system_prompt
+        self.max_iterations = max_iterations if max_iterations is not None else MAX_ITERATIONS
+        self.llm_config = llm_config or {}
+        self.checkpointer = checkpointer
+
+        # 初始化LLM
+        self._init_llm()
+
+        # 创建Agent
+        self._create_agent()
+
+        # 会话配置：使用传入的 thread_id 或生成新的 UUID
+        # 确保新对话不加载旧历史，同时与 main.py 的 conversation_id 保持一致
+        import uuid
+        self._default_thread_id = thread_id or str(uuid.uuid4())
+        self.config = {
+            "configurable": {
+                "thread_id": self._default_thread_id
+            },
+            "recursion_limit": RECURSION_LIMIT
+        }
+
+        # 暴露工具列表
+        self.tools = ALL_TOOLS
+
+        # 环境感知缓存 — 后台刷新，不阻塞对话
+        self._cached_env_tag = None
+        self._refresh_env_lock = asyncio.Lock()
+
+        # 初始化记忆系统，用于用户画像更新
+        self.memory = LongTermMemory(memory_dir=os.path.join(PROJECT_ROOT, "memory"))
+        # 设置全局记忆实例，供update_user_profile工具使用
+        set_memory_instance(self.memory)
+        # 预加载用户画像，只加载一次，避免破坏缓存
+        self._user_profile = self.memory.get_user_profile()
+
+        # 初始化日志系统
+        self.logger = AgentLogger(log_dir=os.path.join(PROJECT_ROOT, "logs"))
+        # 确保任务目录存在
+        os.makedirs(TASKS_DIR, exist_ok=True)
+
+        # 后台子Agent执行结果缓存（用于下次对话通知用户）
+        self._background_task_results: list[dict] = []
+
+        # 子Agent LLM缓存（复用配置，避免每个任务创建新客户端）
+        self._executor_llm = None
+
+    def _run_sensor(self, cmd: str, timeout: int = 5) -> Optional[str]:
+        """执行Termux传感器命令，返回stdout或None"""
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            return None
+
+    def _sense_environment(self) -> Optional[str]:
+        """采集环境状态，返回自然语言格式的环境标签或None"""
+        try:
+            # 时间与时区
+            time_out = self._run_sensor(ENV_TIME_CMD)
+            tz_out = self._run_sensor(ENV_TIMEZONE_CMD)
+            if not time_out:
+                return None
+            hour = int(time_out.split(":")[0])
+            tz = tz_out or ""
+
+            descs = []
+
+            # 时段判断
+            if hour >= 6 and hour < 12:
+                descs.append(f"现在是{time_out}({tz})，上午工作时段")
+            elif hour >= 12 and hour < 14:
+                descs.append(f"现在是{time_out}({tz})，中午休息时段")
+            elif hour >= 14 and hour < 18:
+                descs.append(f"现在是{time_out}({tz})，下午工作时段")
+            elif hour >= 18 and hour < 22:
+                descs.append(f"现在是{time_out}({tz})，傍晚休息时段")
+            else:
+                descs.append(f"现在是{time_out}({tz})，深夜休息时段")
+
+            # 光照
+            light_out = self._run_sensor(ENV_LIGHT_SENSOR_CMD)
+            if light_out:
+                try:
+                    light_data = json.loads(light_out)
+                    for v in light_data.values():
+                        if isinstance(v, dict) and "values" in v and v["values"]:
+                            lux = v["values"][0]
+                            if lux < 1:
+                                descs.append("环境极暗")
+                            elif lux < 50:
+                                descs.append("环境较暗")
+                            elif lux < 500:
+                                descs.append("光线正常，室内")
+                            else:
+                                descs.append("光线明亮")
+                            break
+                except json.JSONDecodeError:
+                    pass
+
+            # 加速度计判断活动状态
+            accel_out = self._run_sensor(ENV_ACCEL_SENSOR_CMD)
+            if accel_out:
+                try:
+                    accel_data = json.loads(accel_out)
+                    for v in accel_data.values():
+                        if isinstance(v, dict) and "values" in v:
+                            vals = v["values"]
+                            if len(vals) >= 3:
+                                x_vals = vals[0::3][:3]
+                                y_vals = vals[1::3][:3]
+                                z_vals = vals[2::3][:3]
+                                max_diff = max(
+                                    max(x_vals) - min(x_vals),
+                                    max(y_vals) - min(y_vals),
+                                    max(z_vals) - min(z_vals),
+                                )
+                                if max_diff < 0.3:
+                                    descs.append("手机静止，用户可能坐着或没在使用手机")
+                                elif max_diff < 2.0:
+                                    descs.append("手机有轻微活动")
+                                else:
+                                    descs.append("手机在移动中，用户可能在走路或活动")
+                            break
+                except json.JSONDecodeError:
+                    pass
+
+            # 电池
+            batt_out = self._run_sensor("termux-battery-status")
+            if batt_out:
+                try:
+                    batt = json.loads(batt_out)
+                    pct = batt.get("percentage", 0)
+                    plugged = batt.get("plugged", "")
+                    if pct < 20:
+                        descs.append(f"电量不足({pct}%，建议简短回复)")
+                    elif pct < 100 and plugged == "UNPLUGGED":
+                        descs.append(f"电量{pct}%未充电")
+                    else:
+                        pct_info = f"电量{pct}%"
+                        if plugged != "UNPLUGGED":
+                            pct_info += "充电中"
+                        descs.append(pct_info)
+                except json.JSONDecodeError:
+                    pass
+
+            # 位置
+            loc_out = self._run_sensor('termux-location -p network', timeout=3)
+            if loc_out:
+                try:
+                    loc = json.loads(loc_out)
+                    lat, lng = loc.get("latitude"), loc.get("longitude")
+                    if lat and lng:
+                        descs.append(f"定位({lat:.2f},{lng:.2f})")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            return "[环境状态感知] " + "；".join(descs) + "。（仅供内部参考，不要在回复中提及此信息）"
+        except Exception:
+            return None
+
+    async def _refresh_env_cache(self) -> None:
+        """后台异步刷新环境感知缓存，不阻塞主流程"""
+        if self._refresh_env_lock.locked():
+            return  # 已有刷新任务在进行，跳过本次
+        async with self._refresh_env_lock:
+            loop = asyncio.get_event_loop()
+            tag = await loop.run_in_executor(None, self._sense_environment)
+            if tag:
+                self._cached_env_tag = tag
+
+    async def _search_relevant_memories(self, query: str, top_n: int = 3) -> str:
+        """主动搜索与用户消息相关的记忆，返回格式化文本（供注入上下文）"""
+        try:
+            loop = asyncio.get_event_loop()
+            def _do_search():
+                services = get_runtime_services(
+                    db_path=os.path.join(PROJECT_ROOT, "pocket_agent.db"),
+                    project_root=PROJECT_ROOT,
+                )
+                return services.memory.search(query, top_n=top_n)
+            results = await loop.run_in_executor(None, _do_search)
+            if not results:
+                return ""
+            # 过滤舞蹈类记忆（数据量大，浪费 token；agent 可用 search_memory 显式检索）
+            lines = []
+            for r in results:
+                if r.get("memory_type") == "dance":
+                    continue
+                content = r["content"]
+                if len(content) > 150:
+                    content = content[:150] + "..."
+                lines.append(f"- {content}")
+            if not lines:
+                return ""
+            return "[相关记忆]\n" + "\n".join(lines)
+        except Exception:
+            return ""
+
+    def _init_llm(self) -> None:
+        """初始化LLM客户端"""
+        default_config = {
+            "base_url": "http://127.0.0.1:8080/v1",
+            "api_key": "dummy",
+            "model": "gelab-zero-4b-preview",
+            "temperature": 0.7,
+            "max_tokens": 8000,
+            "timeout": 30,  # 总超时30秒
+            "max_retries": 1,  # 失败后最多重试1次
+        }
+        config = {**default_config, **self.llm_config}
+
+        # 如果API key为空或dummy，使用mock配置避免OpenAI验证错误
+        if not config["api_key"] or config["api_key"] == "dummy":
+            # 使用一个不会实际发起网络请求的配置
+            config["base_url"] = "http://mock.localhost:9999/v1"
+            config["api_key"] = "mock-key"
+
+        # 初始化ChatOpenAI客户端
+        self.llm = ChatOpenAI(
+            base_url=config["base_url"],
+            api_key=config["api_key"],
+            model=config["model"],
+            temperature=config["temperature"],
+            max_tokens=config["max_tokens"],
+            timeout=config["timeout"],
+            streaming=True,
+            verbose=False,
+            max_retries=config.get("max_retries", 2),  # 失败后重试
+        )
+
+    def _create_agent(self) -> None:
+        """使用官方create_agent创建Agent，内置中间件限制工具调用"""
+        # 预加载技能列表
+        skills_list = load_skills_list("main")
+
+        # 动态注入工具列表和技能列表到增强提示词
+        tool_names = ", ".join([tool.name for tool in ALL_TOOLS])
+        enhanced_system_prompt = self.base_system_prompt + "\n\n" + agent_enhance_prompt.format(
+            tool_names=tool_names,
+            skills_list=skills_list,
+            tasks_dir=TASKS_DIR,
+            logs_dir=LOGS_DIR
+        )
+
+        # 配置中间件
+        middleware = [
+            # MCP工具结果处理：将图片base64转换为正确的多模态格式，避免纯文本token爆炸
+            MCPToolResultMiddleware(),
+            # 图片内容优化：避免历史图片base64数据累积导致token溢出
+            ImageOptimizationMiddleware(),
+            # 连续重复工具调用检测：第二次重复时返回警告，让模型自我纠正
+            ToolCallRepeatMiddleware(),
+            # 修复工具调用ID：某些LLM生成的tool_call缺少id字段
+            ToolCallIdMiddleware(),
+            # 历史消息自动压缩：token超过64K时自动压缩，保留最近20条消息
+            SummarizationMiddleware(
+                model=self.llm,  # 使用当前配置的模型进行压缩
+                trigger=("tokens", int(MAX_CONTEXT_TOKENS * 0.60)),
+                keep=("messages", 24),  # 约保留最近12轮，并保留未闭合工具链
+            ),
+            # 模型调用次数限制：单次运行最多调用MAX_ITERATIONS次模型（对应最多MAX_ITERATIONS轮迭代）
+            # 达到限制后自动优雅结束，不会报错
+            ModelCallLimitMiddleware(
+                run_limit=MAX_ITERATIONS,
+                exit_behavior="end",
+            )
+        ]
+
+        # 持久化存储 — 使用外部传入的 AsyncSqliteSaver（app.py 初始化）
+        if self.checkpointer is None:
+            self.checkpointer = MemorySaver()
+
+        # 保存系统提示词用于token统计（state中的messages不包含系统提示词）
+        self._system_prompt = enhanced_system_prompt
+
+        # 使用官方create_agent创建Agent，递归限制在config中配置
+        self.agent = create_agent(
+            model=self.llm,
+            tools=ALL_TOOLS,
+            system_prompt=enhanced_system_prompt,
+            checkpointer=self.checkpointer,
+            middleware=middleware,
+        )
+
+    def _format_tool_args(self, tool_name: str, args: dict) -> str:
+        """格式化工具参数为详细显示文本，截断50字符"""
+        if not args:
+            return ""
+
+        # 特殊处理某些工具，显示更有意义的参数
+        if tool_name == "file_read" and "filepath" in args:
+            filepath = args["filepath"]
+            # 显示父目录/文件名，区分不同目录下的同名文件
+            parent = os.path.basename(os.path.dirname(filepath))
+            filename = os.path.basename(filepath)
+            display = f"{parent}/{filename}" if parent and parent != "." else filename
+            return display[:50]
+        elif tool_name == "file_write" and "filepath" in args:
+            filepath = args["filepath"]
+            parent = os.path.basename(os.path.dirname(filepath))
+            filename = os.path.basename(filepath)
+            display = f"{parent}/{filename}" if parent and parent != "." else filename
+            content_preview = args.get("content", "")[:20]
+            result = f"{display}, content={content_preview}..."
+            return result[:50] + "..." if len(result) > 50 else result
+        elif tool_name == "file_search" and "pattern" in args:
+            pattern = args["pattern"]
+            directory = args.get("directory", "")
+            if directory:
+                return f"pattern={pattern}, dir={os.path.basename(directory)}"
+            return f"pattern={pattern}"
+        elif tool_name == "shell_exec" and "command" in args:
+            command = args["command"]
+            return command[:50] + "..." if len(command) > 50 else command
+        elif tool_name == "mcp_call" and "tool_name" in args:
+            mcp_tool = args["tool_name"]
+            mcp_args = args.get("arguments", {})
+            if mcp_args:
+                args_preview = str(mcp_args)[:30]
+                return f"{mcp_tool}, args={args_preview}..."
+            return mcp_tool
+        elif tool_name == "search_memory" and "query" in args:
+            query = args["query"]
+            return f"query={query}" if len(query) <= 45 else f"query={query[:45]}..."
+        elif tool_name == "body_script" and "script" in args:
+            script = args["script"]
+            return script[:50] + "..." if len(script) > 50 else script
+        elif tool_name == "delegate_task" and "objective" in args:
+            objective = args["objective"]
+            return objective[:50] + "..." if len(objective) > 50 else objective
+        elif tool_name == "tts_speak" and "text" in args:
+            text = args["text"]
+            return text[:50] + "..." if len(text) > 50 else text
+        else:
+            # 通用处理：显示所有参数（屏蔽内部字段）
+            params = []
+            for k, v in args.items():
+                if k.startswith('_'):
+                    continue
+                v_str = str(v)
+                if len(v_str) > 20:
+                    v_str = v_str[:20] + "..."
+                params.append(f"{k}={v_str}")
+            result = ", ".join(params)
+            return result[:50] + "..." if len(result) > 50 else result
+
+    def _get_last_tool_args(self, tool_name: str, tool_call_id: str = None) -> dict:
+        """获取最近一次指定工具调用的参数"""
+        cache = getattr(self, '_last_tool_args_cache', {})
+        # 优先通过 tool_call_id 查找
+        if tool_call_id and tool_call_id in cache:
+            return cache[tool_call_id]
+        # 回退：查找最近的同名工具调用
+        for key in reversed(list(cache.keys())):
+            if cache[key].get('_tool_name') == tool_name:
+                return cache[key]
+        return {}
+
+    def _cache_tool_args(self, tool_name: str, args: dict, tool_call_id: str = None):
+        """缓存工具调用参数，供tool_end事件使用"""
+        if not hasattr(self, '_last_tool_args_cache'):
+            self._last_tool_args_cache = {}
+        # 使用 tool_call_id 作为键，避免同名工具覆盖
+        key = tool_call_id or tool_name
+        args_with_name = {**args, '_tool_name': tool_name}
+        self._last_tool_args_cache[key] = args_with_name
+
+    async def get_context_usage(self) -> dict:
+        """获取当前完整上下文的token用量
+        直接构建实际发送给AI的完整messages数组+工具定义，一次性估算。
+        Returns:
+            {"current": int, "max": int, "percentage": float}
+            失败时返回0/128000/0
+        """
+        try:
+            state = await self.agent.aget_state(self.config)
+            state_messages = state.values.get("messages", []) or []
+
+            # 构建实际发送给LLM的完整messages：[系统提示词, *对话历史, *当前输入]
+            full_messages = []
+            sys_prompt = getattr(self, '_system_prompt', '')
+            if sys_prompt:
+                full_messages.append(SystemMessage(content=sys_prompt))
+            full_messages.extend(state_messages)
+
+            # 一次性估算：messages（含tool_calls）+ tools（按JSON schema格式）
+            # chars_per_token=2.0 更适合中英文混合场景（默认4.0偏英文）
+            current_tokens = count_tokens_approximately(
+                full_messages,
+                tools=list(ALL_TOOLS),
+                chars_per_token=2.0,
+            )
+
+            return {
+                "current": current_tokens,
+                "max": MAX_CONTEXT_TOKENS,
+                "percentage": round(current_tokens / MAX_CONTEXT_TOKENS * 100, 1)
+            }
+        except Exception:
+            return {"current": 0, "max": MAX_CONTEXT_TOKENS, "percentage": 0.0}
+
+    async def run_conversation(
+        self,
+        user_message: str,
+        on_token: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_tool_event: Optional[Callable[[dict], Awaitable[None]]] = None,
+    ) -> Tuple[str, bool, int]:
+        """
+        运行对话
+        Args:
+            user_message: 用户输入消息
+            on_token: 可选的异步回调，每收到一个 token chunk 时调用，用于实现真正的流式推送
+            on_tool_event: 可选的异步回调，工具调用事件（tool_start/tool_end/thinking），用于推送工具执行进度
+        Returns:
+            (响应内容, 是否使用了流式输出, 本次对话调用工具次数)
+        """
+        try:
+            full_response = ""
+            progress_display = None
+            tool_call_count = 0  # 统计本次对话的工具调用次数
+            start_time = datetime.now()  # 记录开始时间，用于总耗时
+            services = get_runtime_services(
+                db_path=os.path.join(PROJECT_ROOT, "pocket_agent.db"),
+                project_root=PROJECT_ROOT,
+            )
+            conversation_id = self.config["configurable"]["thread_id"]
+            conv_task_id = services.runs.create_run(
+                conversation_id=conversation_id,
+                objective=user_message,
+            )
+            set_conversation_id(conversation_id)
+            set_run_id(conv_task_id)
+            services.runs.transition(conv_task_id, RunStatus.EXECUTING.value)
+            await services.events.publish(
+                conv_task_id, "plan", {"objective": user_message, "steps": []}
+            )
+
+            # 记录对话开始
+            self.logger.log_conversation_start(conv_task_id, user_message)
+
+            # 通知用户后台任务完成
+            if self._background_task_results and self.ui and hasattr(self.ui, 'console'):
+                for _r in self._background_task_results:
+                    status_icon = "✅" if _r.get("status") == "completed" else "❌"
+                    summary_trunc = _r.get("summary", "")[:120]
+                    self.ui.console.print(
+                        f"[dim]{status_icon} 后台任务 [{_r['task_id']}] "
+                        f"{summary_trunc}[/dim]"
+                    )
+                self._background_task_results.clear()
+
+            # 初始化进度显示
+            if self.ui and hasattr(self.ui, 'create_progress_display'):
+                progress_display = self.ui.create_progress_display()
+                progress_display.__enter__()
+                progress_display.update("思考中")
+
+            # 环境感知：使用缓存数据（后台异步刷新，不阻塞）
+            # 首次对话无缓存时跳过，后续由后台任务自动刷新
+            env_tag = getattr(self, '_cached_env_tag', None)
+
+            # 主动搜索相关记忆（后台执行，不阻塞对话）
+            memory_text = await self._search_relevant_memories(user_message)
+
+            # 构建消息列表：用户画像 + 环境感知 + 相关记忆合并到用户消息中
+            profile_text = f"{self._user_profile}" if self._user_profile else ""
+            env_text = env_tag if env_tag else ""
+            combined_context = "\n\n".join(filter(None, [profile_text, env_text, memory_text]))
+            if combined_context:
+                combined_message = f"{combined_context}\n\n---\n{user_message}"
+            else:
+                combined_message = user_message
+
+            # Markdown流式Live显示
+            stream_live = None
+
+            # 使用多种stream模式同时获取消息流和执行更新
+            async for chunk in self.agent.astream(
+                {"messages": [HumanMessage(content=combined_message)]},
+                config=self.config,
+                stream_mode=["messages", "updates"],
+                version="v2"
+            ):
+                # 检查取消请求
+                if self._check_cancel():
+                    break
+
+                # 刷新进度时间（每次收到chunk都更新，让时间走动）
+                if progress_display:
+                    progress_display.update()
+
+                # 处理消息流（用于流式输出回复内容）
+                if chunk["type"] == "messages":
+                    message_chunk, metadata = chunk["data"]
+                    node = metadata.get("langgraph_node", "")
+
+                    if node == "model" and hasattr(message_chunk, "content") and message_chunk.content:
+                        # LangGraph stream_mode="messages" 中每个 AIMessageChunk
+                        # 是增量内容，直接追加即可
+                        if type(message_chunk) is AIMessage:
+                            continue
+
+                        content = message_chunk.content
+
+                        # 【去重检测】模型调用工具后可能重新生成文本，造成重复输出
+                        # 条件：已积累100+字符，且当前chunk≥15字符，检查是否在重复已有内容
+                        if len(full_response) > 100 and len(content) >= 15:
+                            recent_window = full_response[-400:]
+                            if content[:30] in recent_window:
+                                continue
+
+                        # 如果是首次收到内容，先关闭进度显示并启动Markdown Live显示
+                        if progress_display:
+                            progress_display.__exit__(None, None, None)
+                            progress_display = None
+                        if stream_live is None and self.ui:
+                            from rich.live import Live
+                            from rich.markdown import Markdown
+                            stream_live = Live(Markdown(""), console=self.ui.console, refresh_per_second=10)
+                            stream_live.__enter__()
+
+                        # 收集完整响应（增量chunk，直接追加）
+                        full_response += content
+
+                        # 更新Live显示为Markdown渲染（全量重新渲染）
+                        if stream_live:
+                            # 仅在内容完整段落时渲染，避免渲染中的行
+                            stream_live.update(Markdown(full_response))
+
+                        # 如果有 on_token 回调，实时推送 token 给调用方
+                        if on_token is not None:
+                            await on_token(content)
+
+                # 处理更新事件（工具调用和进度）
+                elif chunk["type"] == "updates":
+                    for source, update in chunk["data"].items():
+                        if source == "model":
+                            # 模型正在思考或生成工具调用
+                            message = update["messages"][-1]
+                            if hasattr(message, 'tool_calls') and message.tool_calls:
+                                # 检测到工具调用
+                                for tc in message.tool_calls:
+                                    tool_call_count += 1  # 工具调用计数+1
+                                    tool_name = tc["name"]
+                                    tool_args = tc["args"]
+                                    # 记录日志
+                                    self.logger.log_tool_call(
+                                        conv_task_id, tool_call_count,
+                                        tool_name, tool_args, "[执行中]"
+                                    )
+
+                                    # 通知外部工具调用开始
+                                    if on_tool_event is not None:
+                                        await on_tool_event({
+                                            "type": "tool_start",
+                                            "name": tool_name,
+                                            "args": tool_args
+                                        })
+
+                                    # 缓存工具参数，供tool_end事件使用
+                                    tool_call_id = tc.get("id", "")
+                                    self._cache_tool_args(tool_name, tool_args, tool_call_id)
+                                    # 构建详细参数显示（截断50字符）
+                                    args_detail = self._format_tool_args(tool_name, tool_args)
+
+                                    # 如果已经进入流式文本模式，直接打印到控制台
+                                    if stream_live:
+                                        if self.ui:
+                                            self.ui.console.print(f"[cyan]🔧 调用: {tool_name}({args_detail})[/cyan]")
+                                    elif progress_display:
+                                        progress_display.update(f"调用: {tool_name}({args_detail})")
+                            else:
+                                if progress_display:
+                                    progress_display.update("思考中")
+                                if on_tool_event is not None:
+                                    await on_tool_event({"type": "thinking"})
+                        elif source == "tools":
+                            # 工具执行完成
+                            message = update["messages"][-1]
+                            tool_name_2 = message.name if hasattr(message, 'name') else "工具"
+
+                            if on_tool_event is not None:
+                                await on_tool_event({
+                                    "type": "tool_end",
+                                    "name": tool_name_2
+                                })
+
+            # 关闭进度显示
+            if progress_display:
+                progress_display.__exit__(None, None, None)
+
+            # 关闭Markdown Live显示
+            if stream_live:
+                stream_live.__exit__(None, None, None)
+                stream_live = None
+
+            # ── 消费后台任务派发队列，同步执行子Agent并实时显示输出 ──
+            pending_tasks = consume_pending_tasks()
+            for pt in pending_tasks:
+                task_path = pt.get("task_path", "")
+                task_id = pt.get("task_id", "unknown")
+                description = pt.get("description", "")
+                if task_path and os.path.exists(task_path):
+                    if self.ui:
+                        self.ui.console.print(
+                            f"\n[bold yellow]▶ 子Agent执行: {description}[/bold yellow]"
+                        )
+                    async for _event in self._run_executor_foreground(task_path, task_id):
+                        event_type = str(_event.get("type") or "progress")
+                        event_data = {
+                            key: value
+                            for key, value in _event.items()
+                            if key != "type"
+                        }
+                        await services.events.publish(
+                            task_id, event_type, event_data
+                        )
+                        await services.events.publish(
+                            conv_task_id, event_type, event_data
+                        )
+                    child_run = services.runs.get_run(task_id)
+                    child_status = (
+                        child_run["status"] if child_run else RunStatus.FAILED.value
+                    )
+                    await services.events.publish(
+                        task_id,
+                        "done" if child_status == RunStatus.COMPLETED.value else "error",
+                        {"status": child_status},
+                    )
+                    set_run_id(conv_task_id)
+
+            # ── 清理主Agent状态中的 delegate_task 相关消息 ──
+            # 避免下次对话时因工具调用消息格式问题导致 DashScope 400 错误
+            if pending_tasks:
+                try:
+                    state = await self.agent.aget_state(self.config)
+                    msgs = state.values.get("messages", [])
+                    # 查找所有 delegate_task 工具调用的ID
+                    delegate_tc_ids = set()
+                    to_remove_ids = set()
+                    for m in msgs:
+                        if hasattr(m, 'tool_calls') and m.tool_calls:
+                            for tc in m.tool_calls:
+                                if tc.get('name') == 'delegate_task':
+                                    if m.id:
+                                        to_remove_ids.add(m.id)
+                                    delegate_tc_ids.add(tc.get('id', ''))
+                    # 查找对应的 ToolMessage
+                    for m in msgs:
+                        if isinstance(m, ToolMessage) and m.tool_call_id in delegate_tc_ids:
+                            if m.id:
+                                to_remove_ids.add(m.id)
+
+                    if to_remove_ids:
+                        removals = [RemoveMessage(id=mid) for mid in to_remove_ids]
+                        await self.agent.update_state(self.config, {"messages": removals})
+                except Exception:
+                    pass
+
+            # ── 后处理去重 ──
+            # 模型在调用工具（如 tts_speak）后可能重新生成一遍内容，导致重复输出
+            if len(full_response) > 200:
+                # 取前80个字符在后文中查找第二次出现
+                prefix = full_response[:80]
+                dup_pos = full_response.find(prefix, 80)
+                if dup_pos > 0:
+                    full_response = full_response[:dup_pos]
+
+            # 如果stream没有返回内容（极端情况），回退到ainvoke
+            if not full_response:
+                result = await self.agent.ainvoke(
+                    {"messages": [HumanMessage(content=user_message)]},
+                    config=self.config
+                )
+                last_message = result["messages"][-1]
+                full_response = str(last_message.content).strip()
+
+                # 统计ainvoke模式下的工具调用次数
+                for msg in result["messages"]:
+                    if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                        tool_call_count += len(msg.tool_calls)
+
+            # 计算总耗时并获取token用量，打印完成行 | 上下文条
+            elapsed = int((datetime.now() - start_time).total_seconds())
+            usage = await self.get_context_usage()
+            if self.ui:
+                bar_text = ""
+                if usage["current"] > 0:
+                    bar_text = self.ui.format_context_bar(usage)
+                # 先换行再打印，与AI回复内容分开
+                self.ui.console.print(
+                    f"\n\n✅ [dim cyan]完成 (总耗时 {elapsed} 秒)[/dim cyan] {bar_text}"
+                )
+
+            # 记录日志
+            try:
+                self.logger.log_conversation_end(conv_task_id, full_response.strip()[:200], tool_call_count, elapsed)
+            except Exception:
+                pass
+
+            # 后台刷新环境感知缓存，为下一次对话准备（不阻塞本次返回）
+            asyncio.create_task(self._refresh_env_cache())
+
+            services.runs.transition(conv_task_id, RunStatus.VERIFYING.value)
+            services.runs.transition(conv_task_id, RunStatus.COMPLETED.value)
+            await services.events.publish(
+                conv_task_id,
+                "done",
+                {
+                    "response": full_response.strip(),
+                    "tool_calls": tool_call_count,
+                },
+            )
+            return (full_response.strip(), True, tool_call_count)
+
+        except asyncio.CancelledError:
+            # 任务被取消，确保进度显示和Live被关闭
+            if 'progress_display' in locals() and progress_display:
+                try:
+                    progress_display.__exit__(None, None, None)
+                except:
+                    pass
+            if 'stream_live' in locals() and stream_live:
+                try:
+                    stream_live.__exit__(None, None, None)
+                except:
+                    pass
+            if 'services' in locals() and 'conv_task_id' in locals():
+                try:
+                    services.runs.transition(
+                        conv_task_id, RunStatus.CANCELLED.value
+                    )
+                except Exception:
+                    pass
+            raise
+        except KeyboardInterrupt:
+            # 键盘中断，确保进度显示和Live被关闭
+            if 'progress_display' in locals() and progress_display:
+                try:
+                    progress_display.__exit__(None, None, None)
+                except:
+                    pass
+            if 'stream_live' in locals() and stream_live:
+                try:
+                    stream_live.__exit__(None, None, None)
+                except:
+                    pass
+            # 重新抛出，让上层处理中断
+            raise
+        except Exception as e:
+            # 确保进度显示和Live被关闭
+            if 'progress_display' in locals() and progress_display:
+                try:
+                    progress_display.__exit__(type(e), e, None)
+                except:
+                    pass
+            if 'stream_live' in locals() and stream_live:
+                try:
+                    stream_live.__exit__(None, None, None)
+                except:
+                    pass
+
+            # 取消子Agent监控
+            if 'subagent_monitor_task' in locals() and subagent_monitor_task:
+                subagent_monitor_task.cancel()
+
+            import traceback
+            error_details = traceback.format_exc()
+
+            # 特殊处理超时错误
+            error_str = str(e).lower()
+            if "timeout" in error_str or "timed out" in error_str or "time out" in error_str:
+                error_msg = "⏱️  请求超时，请检查网络连接或稍后再试。如果问题持续存在，可以尝试降低模型输出长度或切换到更小的模型。"
+            elif "connection" in error_str or "network" in error_str or "refused" in error_str:
+                error_msg = "🔌  网络连接失败，请检查LLM服务是否正常运行，API地址和密钥是否配置正确。"
+            else:
+                error_msg = f"Agent 执行错误: {str(e)}\n{error_details[:800]}"
+
+            if 'services' in locals() and 'conv_task_id' in locals():
+                try:
+                    services.runs.transition(
+                        conv_task_id, RunStatus.FAILED.value, error_msg
+                    )
+                except Exception:
+                    pass
+            return (error_msg, False, tool_call_count)
+
+    async def stream_conversation(self, user_message: str, thread_id: str = None, history: list = None) -> AsyncGenerator[dict, None]:
+        """
+        流式对话 - async generator，直接 yield 结构化事件，供 FastAPI SSE 端点使用
+        Args:
+            user_message: 用户输入消息
+            thread_id: 可选的会话ID，用于隔离不同会话的对话历史。为None时使用默认session
+            history: 可选的历史消息列表 [{"role": "user"/"assistant", "content": "..."}]
+        Yields:
+            {"type": "token", "content": "你好"}                   -- 文本 token
+            {"type": "tool_start", "name": "...", "args": {...}}    -- 工具调用开始
+            {"type": "tool_end", "name": "..."}                     -- 工具调用完成
+            {"type": "thinking"}                                    -- 模型思考中
+            {"type": "done", "response": "...", "success": True, "tool_calls": N}  -- 完成
+            {"type": "error", "message": "..."}                     -- 错误
+        """
+        # 使用传入的 thread_id 或默认配置，实现会话隔离
+        # 支持 _thread_id_map 映射（clear_history 后旧 thread_id 会映射到新 UUID）
+        actual_thread_id = thread_id or self.config["configurable"]["thread_id"]
+        if hasattr(self, '_thread_id_map') and actual_thread_id in self._thread_id_map:
+            actual_thread_id = self._thread_id_map[actual_thread_id]
+        config = {
+            "configurable": {"thread_id": actual_thread_id},
+            "recursion_limit": self.config.get("recursion_limit", RECURSION_LIMIT),
+        }
+        try:
+            full_response = ""
+            tool_call_count = 0
+            start_time = datetime.now()
+            services = get_runtime_services(
+                db_path=os.path.join(PROJECT_ROOT, "pocket_agent.db"),
+                project_root=PROJECT_ROOT,
+            )
+            conv_task_id = services.runs.create_run(
+                conversation_id=actual_thread_id,
+                objective=user_message,
+            )
+            set_conversation_id(actual_thread_id)
+            set_run_id(conv_task_id)
+            services.runs.transition(conv_task_id, RunStatus.EXECUTING.value)
+            await services.events.publish(
+                conv_task_id, "plan", {"objective": user_message, "steps": []}
+            )
+            yield {
+                "type": "plan",
+                "run_id": conv_task_id,
+                "objective": user_message,
+                "steps": [],
+            }
+
+            # 记录对话开始
+            self.logger.log_conversation_start(conv_task_id, user_message)
+
+            # 环境感知：使用缓存数据（后台异步刷新，不阻塞）
+            env_tag = getattr(self, '_cached_env_tag', None)
+
+            # 主动搜索相关记忆
+            memory_text = await self._search_relevant_memories(user_message)
+
+            # 构建消息列表：用户画像 + 环境感知 + 相关记忆合并到用户消息中
+            profile_text = f"{self._user_profile}" if self._user_profile else ""
+            env_text = env_tag if env_tag else ""
+            combined_context = "\n\n".join(filter(None, [profile_text, env_text, memory_text]))
+            if combined_context:
+                combined_message = f"{combined_context}\n\n---\n{user_message}"
+            else:
+                combined_message = user_message
+
+            # 构建输入消息：历史消息 + 当前消息
+            input_messages = []
+            if history:
+                # Checkpoint 有状态时不再重复注入 messages 表中的相同历史。
+                # 只有 MemorySaver 重启丢失或新 thread 时才用 transcript 恢复。
+                checkpoint_has_messages = False
+                try:
+                    state = await self.agent.aget_state(config)
+                    checkpoint_has_messages = bool(
+                        state.values.get("messages", []) if state else []
+                    )
+                except Exception:
+                    checkpoint_has_messages = False
+                if not checkpoint_has_messages:
+                    for msg in history:
+                        if msg["role"] == "user":
+                            input_messages.append(HumanMessage(content=msg["content"]))
+                        elif msg["role"] == "assistant":
+                            input_messages.append(AIMessage(content=msg["content"]))
+            input_messages.append(HumanMessage(content=combined_message))
+
+            async for chunk in self.agent.astream(
+                {"messages": input_messages},
+                config=config,
+                stream_mode=["messages", "updates", "custom"],
+                version="v2"
+            ):
+                if self._check_cancel():
+                    break
+
+                # 处理工具执行进度（get_stream_writer 推送）
+                if chunk["type"] == "custom":
+                    progress_data = chunk["data"]
+                    if isinstance(progress_data, dict) and progress_data.get("type") == "progress":
+                        yield {"type": "progress", "message": progress_data.get("message", "")}
+                    continue
+
+                # 处理消息流（用于流式输出回复内容）
+                if chunk["type"] == "messages":
+                    message_chunk, metadata = chunk["data"]
+                    node = metadata.get("langgraph_node", "")
+
+                    if node == "model" and hasattr(message_chunk, "content"):
+                        # 检查是否有推理内容（DeepSeek 等模型的思考过程）
+                        rc = message_chunk.additional_kwargs.get("reasoning_content", "") if hasattr(message_chunk, "additional_kwargs") else ""
+                        if rc:
+                            yield {"type": "thinking"}
+
+                        if message_chunk.content:
+                            # LangGraph stream_mode="messages" 中每个 AIMessageChunk
+                            # 是增量内容，直接追加即可
+                            if type(message_chunk) is AIMessage:
+                                continue
+
+                            content = message_chunk.content
+
+                            # 【去重检测】模型调用工具后可能重新生成文本，造成重复输出
+                            # 条件：已积累100+字符，且当前chunk>=15字符，检查是否在重复已有内容
+                            if len(full_response) > 100 and len(content) >= 15:
+                                recent_window = full_response[-400:]
+                                if content[:30] in recent_window:
+                                    continue
+
+                            # 收集完整响应（增量chunk，直接追加）
+                            full_response += content
+
+                            # yield 文本 token
+                            yield {"type": "token", "content": content}
+
+                # 处理更新事件（用于进度显示）
+                elif chunk["type"] == "updates":
+                    for source, update in chunk["data"].items():
+                        if source == "model":
+                            message = update["messages"][-1]
+                            if hasattr(message, 'tool_calls') and message.tool_calls:
+                                # 检测到工具调用
+                                for tc in message.tool_calls:
+                                    tool_call_count += 1  # 工具调用计数+1
+                                    tool_name = tc["name"]
+                                    tool_args = tc["args"]
+                                    # 记录日志
+                                    self.logger.log_tool_call(
+                                        conv_task_id, tool_call_count,
+                                        tool_name, tool_args, "[执行中]"
+                                    )
+                                    # 缓存工具参数，供tool_end事件使用
+                                    tool_call_id = tc.get("id", "")
+                                    self._cache_tool_args(tool_name, tool_args, tool_call_id)
+
+                                    # yield 工具调用开始事件（带详细参数）
+                                    yield {
+                                        "type": "tool_start",
+                                        "name": tool_name,
+                                        "args": tool_args,
+                                        "args_display": self._format_tool_args(tool_name, tool_args)
+                                    }
+                            else:
+                                # 模型思考中
+                                yield {"type": "thinking"}
+                        elif source == "tools":
+                            # 工具执行完成
+                            message = update["messages"][-1]
+                            tool_name_2 = message.name if hasattr(message, 'name') else "工具"
+                            # 尝试通过 tool_call_id 获取缓存的参数
+                            tool_call_id_2 = message.tool_call_id if hasattr(message, 'tool_call_id') else None
+                            tool_args_2 = self._get_last_tool_args(tool_name_2, tool_call_id_2)
+                            args_display_2 = self._format_tool_args(tool_name_2, tool_args_2) if tool_args_2 else ""
+                            yield {
+                                "type": "tool_end",
+                                "name": tool_name_2,
+                                "args_display": args_display_2
+                            }
+
+            # ── 消费后台任务派发队列，同步执行子Agent并实时显示输出 ──
+            pending_tasks = consume_pending_tasks()
+            for pt in pending_tasks:
+                task_path = pt.get("task_path", "")
+                task_id = pt.get("task_id", "unknown")
+                description = pt.get("description", "")
+                if task_path and os.path.exists(task_path):
+                    # 存储子Agent任务引用，供 /cancel 终止
+                    self._executor_task = asyncio.current_task()
+                    try:
+                        async for event in self._run_executor_foreground(task_path, task_id):
+                            if self._check_cancel():
+                                break
+                            await services.events.publish(
+                                task_id,
+                                str(event.get("type") or "progress"),
+                                {
+                                    key: value
+                                    for key, value in event.items()
+                                    if key != "type"
+                                },
+                            )
+                            yield event
+                        child_run = services.runs.get_run(task_id)
+                        child_status = (
+                            child_run["status"] if child_run else RunStatus.FAILED.value
+                        )
+                        await services.events.publish(
+                            task_id,
+                            "done" if child_status == RunStatus.COMPLETED.value else "error",
+                            {"status": child_status},
+                        )
+                        set_run_id(conv_task_id)
+                    finally:
+                        self._executor_task = None
+
+            # ── 清理主Agent状态中的 delegate_task 相关消息 ──
+            # 避免下次对话时因工具调用消息格式问题导致 DashScope 400 错误
+            if pending_tasks:
+                try:
+                    state = await self.agent.aget_state(config)
+                    msgs = state.values.get("messages", [])
+                    # 查找所有 delegate_task 工具调用的ID
+                    delegate_tc_ids = set()
+                    to_remove_ids = set()
+                    for m in msgs:
+                        if hasattr(m, 'tool_calls') and m.tool_calls:
+                            for tc in m.tool_calls:
+                                if tc.get('name') == 'delegate_task':
+                                    if m.id:
+                                        to_remove_ids.add(m.id)
+                                    delegate_tc_ids.add(tc.get('id', ''))
+                    # 查找对应的 ToolMessage
+                    for m in msgs:
+                        if isinstance(m, ToolMessage) and m.tool_call_id in delegate_tc_ids:
+                            if m.id:
+                                to_remove_ids.add(m.id)
+
+                    if to_remove_ids:
+                        removals = [RemoveMessage(id=mid) for mid in to_remove_ids]
+                        await self.agent.update_state(config, {"messages": removals})
+                except Exception:
+                    pass
+
+            # ── 后处理去重 ──
+            # 模型在调用工具（如 tts_speak）后可能重新生成一遍内容，导致重复输出
+            if len(full_response) > 200:
+                # 取前80个字符在后文中查找第二次出现
+                prefix = full_response[:80]
+                dup_pos = full_response.find(prefix, 80)
+                if dup_pos > 0:
+                    full_response = full_response[:dup_pos]
+
+            # 如果stream没有返回内容（极端情况），回退到ainvoke
+            if not full_response:
+                result = await self.agent.ainvoke(
+                    {"messages": [HumanMessage(content=user_message)]},
+                    config=config
+                )
+                last_message = result["messages"][-1]
+                full_response = str(last_message.content).strip()
+
+                # 统计ainvoke模式下的工具调用次数
+                for msg in result["messages"]:
+                    if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                        tool_call_count += len(msg.tool_calls)
+
+                # yield 回退的完整响应
+                yield {"type": "token", "content": full_response}
+
+            # 记录日志
+            elapsed = int((datetime.now() - start_time).total_seconds())
+            try:
+                self.logger.log_conversation_end(conv_task_id, full_response.strip()[:200], tool_call_count, elapsed)
+            except Exception:
+                pass
+
+            # 后台刷新环境感知缓存，为下一次对话准备（不阻塞本次返回）
+            asyncio.create_task(self._refresh_env_cache())
+
+            # yield 完成事件
+            services.runs.transition(conv_task_id, RunStatus.VERIFYING.value)
+            services.runs.transition(conv_task_id, RunStatus.COMPLETED.value)
+            await services.events.publish(
+                conv_task_id,
+                "done",
+                {
+                    "response": full_response.strip(),
+                    "tool_calls": tool_call_count,
+                    "elapsed": elapsed,
+                },
+            )
+            yield {
+                "type": "done",
+                "run_id": conv_task_id,
+                "response": full_response.strip(),
+                "success": True,
+                "tool_calls": tool_call_count,
+                "elapsed": elapsed,
+            }
+
+        except asyncio.CancelledError:
+            if 'services' in locals() and 'conv_task_id' in locals():
+                try:
+                    services.runs.transition(
+                        conv_task_id, RunStatus.CANCELLED.value
+                    )
+                except Exception:
+                    pass
+            raise
+        except KeyboardInterrupt:
+            # 重新抛出，让上层处理中断
+            raise
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+
+            # 特殊处理超时错误
+            error_str = str(e).lower()
+            if "timeout" in error_str or "timed out" in error_str or "time out" in error_str:
+                error_msg = "⏱️  请求超时，请检查网络连接或稍后再试。如果问题持续存在，可以尝试降低模型输出长度或切换到更小的模型。"
+            elif "connection" in error_str or "network" in error_str or "refused" in error_str:
+                error_msg = "\U0001f50c  网络连接失败，请检查LLM服务是否正常运行，API地址和密钥是否配置正确。"
+            else:
+                error_msg = f"Agent 执行错误: {str(e)}\n{error_details[:800]}"
+
+            if 'services' in locals() and 'conv_task_id' in locals():
+                try:
+                    services.runs.transition(
+                        conv_task_id, RunStatus.FAILED.value, error_msg
+                    )
+                    await services.events.publish(
+                        conv_task_id, "error", {"message": error_msg}
+                    )
+                except Exception:
+                    pass
+            yield {
+                "type": "error",
+                "run_id": conv_task_id if 'conv_task_id' in locals() else "",
+                "message": error_msg,
+            }
+
+    def clear_history(self, thread_id: str = None) -> None:
+        """清空指定会话的对话历史"""
+        import uuid
+        if thread_id:
+            # 为该会话生成新的内部 thread_id，旧历史自动失效
+            self._thread_id_map = getattr(self, '_thread_id_map', {})
+            self._thread_id_map[thread_id] = str(uuid.uuid4())
+        else:
+            # 清空默认会话
+            self.config = {
+                "configurable": {
+                    "thread_id": str(uuid.uuid4())
+                },
+                "recursion_limit": self.max_iterations
+            }
+
+    def switch_conversation(self, thread_id: str) -> None:
+        """切换到指定会话（恢复 checkpoint 中的对话历史）
+
+        与 clear_history 不同：不销毁旧状态，直接切换 thread_id 以加载已有 checkpoint。
+        """
+        self._thread_id_map = getattr(self, '_thread_id_map', {})
+        # 清除该 thread_id 的重映射（如果有），恢复原始 thread_id
+        self._thread_id_map.pop(thread_id, None)
+        self.config = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": self.config.get("recursion_limit", RECURSION_LIMIT),
+        }
+
+    def cancel(self) -> None:
+        """请求取消当前正在执行的推理"""
+        self._cancel_requested = True
+
+    def _check_cancel(self) -> bool:
+        """检查是否请求了取消，如果是则重置标志并返回 True"""
+        if getattr(self, '_cancel_requested', False):
+            self._cancel_requested = False
+            return True
+        return False
+
+    async def cleanup(self) -> None:
+        """关闭所有HTTP客户端，避免退出时 httpx 异步生成器报错"""
+        try:
+            if hasattr(self, 'llm') and self.llm is not None:
+                await self.llm.async_client.aclose()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, '_executor_llm') and self._executor_llm is not None:
+                await self._executor_llm.async_client.aclose()
+        except Exception:
+            pass
+
+    def _render_task_progress(self, task_data: dict) -> str:
+        """渲染子Agent任务进度"""
+        lines = []
+        for step in task_data.get("steps", []):
+            status = step.get("status", "pending")
+            desc = step.get("desc", "")
+            if status == "completed":
+                lines.append(f"  \u2714 {desc}")
+            elif status == "in_progress":
+                lines.append(f"  \u23f3 {desc}")
+            elif status == "failed":
+                lines.append(f"  \u2718 {desc}")
+            elif status == "skipped":
+                lines.append(f"  \u293e {desc}")
+            else:
+                lines.append(f"  \u25fb {desc}")
+        return "\n".join(lines) if lines else ""
+
+    async def _run_executor_foreground(self, task_path: str, task_id: str):
+        """前台运行子Agent（executor），yield 结构化事件供 SSE 流式推送"""
+        try:
+            services = get_runtime_services(
+                db_path=os.path.join(PROJECT_ROOT, "pocket_agent.db"),
+                project_root=PROJECT_ROOT,
+            )
+            set_run_id(task_id)
+            try:
+                services.runs.transition(task_id, RunStatus.EXECUTING.value)
+            except (KeyError, ValueError):
+                pass
+            execution_trace = []
+            executor_tool_names = {"shell_exec", "file_read", "file_write", "file_search", "mcp_call", "system_info", "tts_speak"}
+            executor_tools = [t for t in ALL_TOOLS if t.name in executor_tool_names]
+            executor_skills = load_skills_list("executor")
+            executor_tool_names_str = ", ".join(t.name for t in executor_tools)
+
+            from langchain.agents.middleware import ModelCallLimitMiddleware
+            enhanced = executor_enhance_prompt.format(
+                tool_names=executor_tool_names_str,
+                skills_list=executor_skills,
+            )
+            system_content = executor_system_prompt.replace("{tool_rules_and_skills}", enhanced)
+
+            if self._executor_llm is None:
+                # 子Agent LLM 配置：从 .env 读取，未设置的字段继承主Agent
+                _base = EXECUTOR_LLM_CONFIG.get("base_url")
+                _api = EXECUTOR_LLM_CONFIG.get("api_key")
+                _mod = EXECUTOR_LLM_CONFIG.get("model")
+                _tmp = EXECUTOR_LLM_CONFIG.get("temperature")
+                _tok = EXECUTOR_LLM_CONFIG.get("max_tokens")
+                executor_llm_config = {
+                    "base_url": _base if _base else self.llm.openai_api_base,
+                    "api_key": _api if _api else self.llm.openai_api_key,
+                    "model": _mod if _mod else self.llm.model_name,
+                    "temperature": float(_tmp) if _tmp and _tmp.replace(".", "", 1).lstrip("-").isdigit() else 0.5,
+                    "max_tokens": int(_tok) if _tok and _tok.isdigit() else 16000,
+                }
+                # 子Agent任务包含MCP/Shell调用，超时设30s比主Agent的10s更长
+                self._executor_llm = ChatOpenAI(
+                    base_url=executor_llm_config["base_url"],
+                    api_key=executor_llm_config["api_key"],
+                    model=executor_llm_config["model"],
+                    temperature=executor_llm_config["temperature"],
+                    max_tokens=executor_llm_config["max_tokens"],
+                    timeout=30,
+                    streaming=True,
+                    max_retries=1,
+                )
+            executor_llm = self._executor_llm
+            executor_middleware = [
+                ToolCallIdMiddleware(),
+                ModelCallLimitMiddleware(
+                    run_limit=self.max_iterations,
+                    exit_behavior="end",
+                ),
+            ]
+            from langgraph.checkpoint.memory import MemorySaver
+            executor_agent = create_agent(
+                model=executor_llm,
+                tools=executor_tools,
+                system_prompt=system_content,
+                checkpointer=MemorySaver(),
+                middleware=executor_middleware,
+            )
+
+            if not os.path.exists(task_path):
+                if self.ui:
+                    self.ui.console.print("  [red]❌ 任务文件不存在[/red]")
+                self._background_task_results.append({
+                    "task_id": task_id,
+                    "status": "failed",
+                    "summary": "❌ 任务文件不存在",
+                })
+                yield {"type": "executor_done", "task_id": task_id, "status": "failed", "elapsed": 0, "tokens": 0}
+                return
+
+            with open(task_path, "r", encoding="utf-8") as f:
+                task_data = json.load(f)
+            objective = task_data.get("objective", "")
+
+            # 记录子Agent开始
+            self.logger.log_executor_start(task_id, objective)
+            self._executor_step_start = datetime.now()
+            executor_step = 0
+            had_intervention = False  # 是否申请了人工介入
+
+            # yield 子Agent启动标识
+            yield {"type": "executor_start", "task_id": task_id, "objective": objective}
+
+            # 用户画像要求语音时，启动时语音通知
+            _profile = getattr(self, '_user_profile', '') or ''
+            if any(kw in _profile for kw in ['语音', '朗读', '播报', 'voice']):
+                try:
+                    _speak = objective[:80].replace('"', ' ').replace("'", " ")
+                    subprocess.run(
+                        f'termux-tts-speak "开始执行任务：{_speak}" &>/dev/null &',
+                        shell=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+
+            # 搜集已有技能列表，让子Agent知道已经沉淀过哪些
+            existing_skills = []
+            auto_executor_dir = os.path.join(AUTO_SKILLS_DIR, "executor")
+            if os.path.exists(auto_executor_dir):
+                for _cat in sorted(os.listdir(auto_executor_dir)):
+                    _cat_path = os.path.join(auto_executor_dir, _cat)
+                    if os.path.isdir(_cat_path):
+                        existing_skills.append(_cat)
+            skills_hint = f"\n（已有沉淀技能：{', '.join(existing_skills) or '无'}，执行完毕后需沉淀/更新/跳过）"
+
+            # 流式执行子Agent，实时输出
+            full_response = ""
+            async for chunk in executor_agent.astream(
+                {"messages": [HumanMessage(content="请读取 " + task_path + " 并开始执行。" + skills_hint)]},
+                config={"configurable": {"thread_id": "executor_" + task_id}},
+                stream_mode=["messages", "updates"],
+                version="v2",
+            ):
+                if self._check_cancel():
+                    break
+
+                if chunk["type"] == "messages":
+                    message_chunk, metadata = chunk["data"]
+                    node = metadata.get("langgraph_node", "")
+                    if node == "model" and hasattr(message_chunk, "content"):
+                        # 检查推理内容（DeepSeek 等模型的思考过程）
+                        rc = message_chunk.additional_kwargs.get("reasoning_content", "") if hasattr(message_chunk, "additional_kwargs") else ""
+                        if rc:
+                            yield {"type": "thinking"}
+
+                        if message_chunk.content:
+                            if type(message_chunk) is AIMessage:
+                                continue
+                            content = message_chunk.content
+                            full_response += content
+                            if self.ui:
+                                self.ui.print_stream_chunk(content)
+                            yield {"type": "token", "content": content}
+
+                elif chunk["type"] == "updates":
+                    for source, update in chunk["data"].items():
+                        if source == "model":
+                            message = update["messages"][-1]
+                            if hasattr(message, 'tool_calls') and message.tool_calls:
+                                for tc in message.tool_calls:
+                                    executor_step += 1
+                                    tool_name = tc["name"]
+                                    tool_args = tc["args"]
+                                    execution_trace.append({
+                                        "tool_name": tool_name,
+                                        "remote_tool": tool_args.get("tool_name", "") if isinstance(tool_args, dict) else "",
+                                        "arguments": tool_args,
+                                    })
+                                    # 记录日志
+                                    self.logger.log_executor_step(task_id, executor_step, tool_name, tool_args)
+                                    # 缓存工具参数，供tool_end事件使用
+                                    tool_call_id = tc.get("id", "")
+                                    self._cache_tool_args(tool_name, tool_args, tool_call_id)
+                                    # yield 工具调用开始（带详细参数）
+                                    args_display = self._format_tool_args(tool_name, tool_args)
+                                    yield {"type": "tool_start", "name": tool_name, "args": tool_args, "args_display": args_display}
+                                    # 检测人工介入请求（tts_speak 工具 或 shell_exec 调用 termux-tts-speak）
+                                    if tool_name == "tts_speak" and "text" in tool_args:
+                                        had_intervention = True
+                                        speak_text = tool_args["text"][:80]
+                                        self.logger.log_executor_intervention(task_id, f"TTS语音通知: {speak_text}", "pending")
+                                        if self.ui:
+                                            self.ui.console.print(f"\n  [bold yellow]🆘 子Agent申请人工介入: {speak_text}[/bold yellow]")
+                                    elif tool_name == "shell_exec" and "command" in tool_args:
+                                        cmd = tool_args["command"]
+                                        # 兼容旧的 termux-tts-speak shell 调用
+                                        if "termux-tts-speak" in cmd or "termux-tts" in cmd:
+                                            had_intervention = True
+                                            speak_text = cmd.split('"')[1] if '"' in cmd else cmd[30:80]
+                                            self.logger.log_executor_intervention(task_id, f"TTS语音通知: {speak_text}", "pending")
+                                            if self.ui:
+                                                self.ui.console.print(f"\n  [bold yellow]🆘 子Agent申请人工介入: {speak_text}[/bold yellow]")
+                                        else:
+                                            display_cmd = cmd[:60] + "..." if len(cmd) > 60 else cmd
+                                            if self.ui:
+                                                self.ui.console.print(f"[cyan]⚡ {display_cmd}[/cyan]")
+                                    elif tool_name == "mcp_call" and "tool_name" in tool_args:
+                                        mcp_tool = tool_args["tool_name"]
+                                        if self.ui:
+                                            self.ui.console.print(f"[cyan]📱 MCP: {mcp_tool}[/cyan]")
+                                    else:
+                                        # 使用统一的格式化方法显示详细参数
+                                        args_text = self._format_tool_args(tool_name, tool_args)
+                                        if self.ui:
+                                            self.ui.console.print(f"[cyan]🔧 {tool_name}({args_text})[/cyan]")
+                            else:
+                                yield {"type": "thinking"}
+                        elif source == "tools":
+                            message = update["messages"][-1]
+                            tool_name_2 = message.name if hasattr(message, 'name') else "工具"
+                            # 尝试通过 tool_call_id 获取缓存的参数
+                            tool_call_id_2 = message.tool_call_id if hasattr(message, 'tool_call_id') else None
+                            tool_args_2 = self._get_last_tool_args(tool_name_2, tool_call_id_2)
+                            if execution_trace:
+                                execution_trace[-1]["result"] = str(getattr(message, "content", ""))[:1000]
+                            args_display_2 = self._format_tool_args(tool_name_2, tool_args_2) if tool_args_2 else ""
+                            yield {"type": "tool_end", "name": tool_name_2, "args_display": args_display_2}
+
+            # ── 重试机制：如果子Agent没有执行有效操作（仅读了task.json就停了），强制重试 ──
+            # 注意：重试必须使用全新Agent实例 + 内联任务内容，不能复用原对话线程，
+            # 否则 DashScope 会校验历史中的 tool_call/tool_message 配对导致 400 错误
+            retry_count = 0
+            while executor_step <= 2 and retry_count < 2:
+                retry_count += 1
+                if self.ui:
+                    self.ui.console.print(f"\n  [yellow]🔄 子Agent仅执行了{executor_step}步，强制重试第{retry_count}次...[/yellow]")
+
+                # 读取 task.json 内容以内联到指令中
+                try:
+                    with open(task_path, "r", encoding="utf-8") as f:
+                        task_data_retry = json.load(f)
+                    retry_objective = task_data_retry.get("objective", "")
+                    retry_steps = task_data_retry.get("steps", [])
+                except Exception:
+                    retry_objective = ""
+                    retry_steps = []
+
+                steps_lines = []
+                for s in retry_steps:
+                    desc = s.get("desc", "")
+                    steps_lines.append(f"{s['id']}. {desc}")
+                steps_text = "\n".join(steps_lines)
+
+                retry_instruction = (
+                    f"执行以下任务，必须调用工具完成每个步骤，禁止只输出文字：\n\n"
+                    f"目标：{retry_objective}\n"
+                    f"步骤：\n{steps_text}\n\n"
+                    f"可用工具：shell_exec（启动App/查包名/点击）、mcp_call（手机操控）、"
+                    f"file_read/write、tts_speak\n"
+                    f"立即开始执行步骤1，不用再读task.json了！"
+                )
+
+                # 创建全新的 Agent 实例，避免历史消息中的 tool_call 格式问题
+                fresh_agent = create_agent(
+                    model=executor_llm,
+                    tools=executor_tools,
+                    system_prompt=system_content,
+                    checkpointer=MemorySaver(),
+                    middleware=executor_middleware,
+                )
+                async for chunk in fresh_agent.astream(
+                    {"messages": [HumanMessage(content=retry_instruction)]},
+                    config={"configurable": {"thread_id": "executor_retry_" + task_id + "_" + str(retry_count)}},
+                    stream_mode=["messages", "updates"],
+                    version="v2",
+                ):
+                    if self._check_cancel():
+                        break
+
+                    if chunk["type"] == "messages":
+                        message_chunk, metadata = chunk["data"]
+                        node = metadata.get("langgraph_node", "")
+                        if node == "model" and hasattr(message_chunk, "content") and message_chunk.content:
+                            if type(message_chunk) is AIMessage:
+                                continue
+                            content = message_chunk.content
+                            full_response += content
+                            if self.ui:
+                                self.ui.print_stream_chunk(content)
+                            yield {"type": "token", "content": content}
+                    elif chunk["type"] == "updates":
+                        for source, update in chunk["data"].items():
+                            if source == "model":
+                                message = update["messages"][-1]
+                                if hasattr(message, 'tool_calls') and message.tool_calls:
+                                    for tc in message.tool_calls:
+                                        executor_step += 1
+                                        tool_name = tc["name"]
+                                        tool_args = tc["args"]
+                                        execution_trace.append({
+                                            "tool_name": tool_name,
+                                            "remote_tool": tool_args.get("tool_name", "") if isinstance(tool_args, dict) else "",
+                                            "arguments": tool_args,
+                                        })
+                                        self.logger.log_executor_step(task_id, executor_step, tool_name, tool_args)
+                                        # 缓存工具参数，供tool_end事件使用
+                                        tool_call_id = tc.get("id", "")
+                                        self._cache_tool_args(tool_name, tool_args, tool_call_id)
+                                        # yield 工具调用开始（带详细参数）
+                                        args_display = self._format_tool_args(tool_name, tool_args)
+                                        yield {"type": "tool_start", "name": tool_name, "args": tool_args, "args_display": args_display}
+                                        if self.ui:
+                                            # 使用统一的格式化方法显示详细参数
+                                            args_text = self._format_tool_args(tool_name, tool_args)
+                                            self.ui.console.print(f"[cyan]🔧 {tool_name}({args_text})[/cyan]")
+                                else:
+                                    yield {"type": "thinking"}
+                            elif source == "tools":
+                                message = update["messages"][-1]
+                                tool_name_2 = message.name if hasattr(message, 'name') else "工具"
+                                # 尝试通过 tool_call_id 获取缓存的参数
+                                tool_call_id_2 = message.tool_call_id if hasattr(message, 'tool_call_id') else None
+                                tool_args_2 = self._get_last_tool_args(tool_name_2, tool_call_id_2)
+                                if execution_trace:
+                                    execution_trace[-1]["result"] = str(getattr(message, "content", ""))[:1000]
+                                args_display_2 = self._format_tool_args(tool_name_2, tool_args_2) if tool_args_2 else ""
+                                yield {"type": "tool_end", "name": tool_name_2, "args_display": args_display_2}
+                    if self._check_cancel():
+                        break
+
+            # 执行完成
+            if had_intervention:
+                self.logger.log_executor_intervention(task_id, "子Agent在等待后继续执行", "resolved")
+                if self.ui:
+                    self.ui.console.print("\n  [green]✅ 人工介入后继续执行[/green]")
+
+            # 重新从磁盘读取（executor 可能通过 file_write 修改过 steps）
+            executor_end_time = datetime.now()
+            try:
+                with open(task_path, "r", encoding="utf-8") as f:
+                    task_data = json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                pass  # 文件损坏时用原内存数据
+
+            steps = task_data.get("steps", [])
+            failed_steps = [s for s in steps if s.get("status") == "failed"]
+            unfinished_steps = [
+                s for s in steps
+                if s.get("status") not in ("completed", "skipped")
+            ]
+            has_failures = bool(failed_steps or unfinished_steps)
+
+            self.logger.log_executor_reasoning(task_id, full_response)
+            summary = full_response.strip()[:300] if full_response.strip() else "执行完毕"
+            executor_elapsed = int((executor_end_time - self._executor_step_start).total_seconds()) if hasattr(self, '_executor_step_start') else 0
+            task_data["all_completed"] = not has_failures
+            if has_failures:
+                self.logger.log_executor_end(task_id, f"未完成（{len(unfinished_steps)}个步骤未完成）")
+                status_text = f"⚠️ 子Agent未完成（{len(unfinished_steps)}个步骤未完成）"
+            else:
+                self.logger.log_executor_end(task_id, "步骤执行完毕，等待验证")
+                status_text = "🔎 子Agent步骤执行完毕，正在验证"
+            task_data["completed_at"] = datetime.now().isoformat()
+            task_data["summary"] = summary
+            with open(task_path, "w", encoding="utf-8") as f:
+                json.dump(task_data, f, ensure_ascii=False, indent=2)
+            services.runs.sync_task_export(task_data)
+
+            try:
+                services.runs.transition(task_id, RunStatus.VERIFYING.value)
+            except (KeyError, ValueError):
+                pass
+            verification = ExecutionVerifier().verify(task_data, execution_trace)
+            task_data["verification"] = {
+                "verified": verification.verified,
+                "reason": verification.reason,
+                "observations": verification.observations,
+                "artifacts": verification.artifacts,
+            }
+            with open(task_path, "w", encoding="utf-8") as f:
+                json.dump(task_data, f, ensure_ascii=False, indent=2)
+            services.runs.sync_task_export(task_data)
+            yield {
+                "type": "verify",
+                "task_id": task_id,
+                "verified": verification.verified,
+                "reason": verification.reason,
+                "observations": verification.observations,
+            }
+            try:
+                services.runs.transition(
+                    task_id,
+                    RunStatus.COMPLETED.value if verification.verified else RunStatus.FAILED.value,
+                    "" if verification.verified else verification.reason,
+                )
+            except (KeyError, ValueError):
+                pass
+
+            try:
+                executor_state = await executor_agent.aget_state(
+                    {"configurable": {"thread_id": "executor_" + task_id}}
+                )
+                executor_msgs = executor_state.values.get("messages", []) or []
+                executor_tokens = count_tokens_approximately(
+                    executor_msgs,
+                    tools=list(executor_tools),
+                    chars_per_token=2.0,
+                )
+                token_text = f" | 消耗 ≈{executor_tokens} tokens"
+            except Exception:
+                executor_tokens = 0
+                token_text = ""
+
+            if self.ui:
+                self.ui.console.print(f"\n  [green]{status_text}，⏱️ {executor_elapsed}s{token_text}[/green]")
+                verify_color = "green" if verification.verified else "yellow"
+                self.ui.console.print(f"  [{verify_color}]验证：{verification.reason}[/{verify_color}]")
+
+            final_status = "completed" if verification.verified else "unverified"
+            yield {"type": "executor_done", "task_id": task_id, "status": final_status, "elapsed": executor_elapsed, "tokens": executor_tokens}
+
+            yield {
+                "type": "skill_condense",
+                "status": "drafting",
+                "message": "正在提取、脱敏并整理候选 Skill",
+            }
+            candidate = await SkillCurator(
+                services.skills,
+                llm=self.llm,
+            ).create_candidate_async(
+                run_id=task_id,
+                objective=task_data.get("objective", ""),
+                steps=steps,
+                trace=execution_trace,
+                verification=VerificationEvidence(
+                    verified=verification.verified,
+                    reason=verification.reason,
+                    artifacts=verification.artifacts,
+                    observations=verification.observations,
+                ),
+            )
+            if candidate:
+                yield {
+                    "type": "skill_candidate",
+                    "status": "reviewing",
+                    "skill": candidate["id"],
+                    "path": candidate["content_path"],
+                    "generation_method": candidate.get("generation_method", ""),
+                    "quality_warnings": candidate.get("quality_warnings", []),
+                }
+                if self.ui:
+                    self.ui.console.print(
+                        f"\n  [dim]📝 已生成待审核 Skill: {candidate['id']}[/dim]"
+                    )
+
+            return
+
+        except asyncio.CancelledError:
+            if 'full_response' in locals():
+                self.logger.log_executor_reasoning(task_id, full_response)
+            self.logger.log_executor_end(task_id, "中断")
+            if self.ui:
+                self.ui.console.print("\n  [yellow]⏹️ 子Agent执行被中断[/yellow]")
+            if 'services' in locals():
+                try:
+                    services.runs.transition(task_id, RunStatus.CANCELLED.value)
+                except Exception:
+                    pass
+            yield {"type": "executor_done", "task_id": task_id, "status": "cancelled", "elapsed": 0, "tokens": 0}
+            raise
+        except Exception:
+            import traceback
+            error_detail = traceback.format_exc()
+            if 'full_response' in locals():
+                self.logger.log_executor_reasoning(task_id, full_response)
+            # 如果之前申请过人工介入，记录介入失败
+            if 'had_intervention' in locals() and had_intervention:
+                self.logger.log_executor_intervention(task_id, "子Agent异常退出，人工介入未解决问题", "failed")
+            self.logger.log_executor_end(task_id, f"失败: {error_detail}")
+            if 'services' in locals():
+                try:
+                    services.runs.transition(
+                        task_id, RunStatus.FAILED.value, error_detail[:1000]
+                    )
+                except Exception:
+                    pass
+
+            # 标记 task.json 为失败状态
+            try:
+                if os.path.exists(task_path):
+                    with open(task_path, "r", encoding="utf-8") as _f:
+                        _td = json.load(_f)
+                    _td["all_completed"] = False
+                    _td["error"] = str(error_detail)[:500]
+                    with open(task_path, "w", encoding="utf-8") as _f:
+                        json.dump(_td, _f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+            # 提取关键错误信息（去掉冗长的调用栈）
+            error_short = str(error_detail)
+            for _line in reversed(error_detail.split("\n")):
+                _line = _line.strip()
+                if _line and not _line.startswith(("File ", "  ", "During", "Traceback")):
+                    error_short = _line
+                    break
+            if self.ui:
+                if 'had_intervention' in locals() and had_intervention:
+                    self.ui.console.print("\n  [red]❌ 人工介入未解决问题，子Agent执行失败[/red]")
+                self.ui.console.print(f"\n  [red]❌ 子Agent执行失败: {error_short}[/red]")
+
+            # 语音通知用户失败原因
+            try:
+                _err_msg = error_short[:120].replace('"', ' ').replace("'", " ")
+                subprocess.run(
+                    f'termux-tts-speak "任务执行失败：{_err_msg}" &>/dev/null &',
+                    shell=True, timeout=5,
+                )
+            except Exception:
+                pass
+
+            # 记录到后台结果，下次对话时主Agent可查看
+            self._background_task_results.append({
+                "task_id": task_id,
+                "status": "failed",
+                "summary": f"❌ 执行失败: {error_short[:200]}",
+            })
+
+            yield {"type": "executor_done", "task_id": task_id, "status": "failed", "elapsed": 0, "tokens": 0}

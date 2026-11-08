@@ -1,0 +1,282 @@
+{
+  "name": "local-settings-integration-v1",
+  "environment": "local_fixture",
+  "cases": [
+    {
+      "id": "train-0",
+      "group": "train-layout-0",
+      "split": "train",
+      "task": {
+        "objective": "Enable train-network-0",
+        "allowed_tools": [
+          "android_get_ui_tree",
+          "android_tap"
+        ],
+        "contract": {
+          "postconditions": [
+            {
+              "path": "/elements",
+              "op": "contains",
+              "value": {
+                "id": "wifi",
+                "value": true
+              }
+            }
+          ],
+          "invariants": [
+            {
+              "path": "/elements/0/value",
+              "op": "unchanged"
+            }
+          ]
+        }
+      },
+      "initial_state": {
+        "package": "local.settings",
+        "elements": [
+          {
+            "id": "decoy",
+            "text": "Bluetooth",
+            "value": false,
+            "protected": true
+          },
+          {
+            "id": "wifi",
+            "text": "train-network-0",
+            "value": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "train-1",
+      "group": "train-layout-1",
+      "split": "train",
+      "task": {
+        "objective": "Enable train-network-1",
+        "allowed_tools": [
+          "android_get_ui_tree",
+          "android_tap"
+        ],
+        "contract": {
+          "postconditions": [
+            {
+              "path": "/elements",
+              "op": "contains",
+              "value": {
+                "id": "wifi",
+                "value": true
+              }
+            }
+          ],
+          "invariants": [
+            {
+              "path": "/elements/0/value",
+              "op": "unchanged"
+            }
+          ]
+        }
+      },
+      "initial_state": {
+        "package": "local.settings",
+        "elements": [
+          {
+            "id": "decoy",
+            "text": "Bluetooth",
+            "value": false,
+            "protected": true
+          },
+          {
+            "id": "wifi",
+            "text": "train-network-1",
+            "value": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "dev-0",
+      "group": "dev-layout-0",
+      "split": "dev",
+      "task": {
+        "objective": "Enable dev-network-0",
+        "allowed_tools": [
+          "android_get_ui_tree",
+          "android_tap"
+        ],
+        "contract": {
+          "postconditions": [
+            {
+              "path": "/elements",
+              "op": "contains",
+              "value": {
+                "id": "wifi",
+                "value": true
+              }
+            }
+          ],
+          "invariants": [
+            {
+              "path": "/elements/0/value",
+              "op": "unchanged"
+            }
+          ]
+        }
+      },
+      "initial_state": {
+        "package": "local.settings",
+        "elements": [
+          {
+            "id": "decoy",
+            "text": "Bluetooth",
+            "value": false,
+            "protected": true
+          },
+          {
+            "id": "wifi",
+            "text": "dev-network-0",
+            "value": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "dev-1",
+      "group": "dev-layout-1",
+      "split": "dev",
+      "task": {
+        "objective": "Enable dev-network-1",
+        "allowed_tools": [
+          "android_get_ui_tree",
+          "android_tap"
+        ],
+        "contract": {
+          "postconditions": [
+            {
+              "path": "/elements",
+              "op": "contains",
+              "value": {
+                "id": "wifi",
+                "value": true
+              }
+            }
+          ],
+          "invariants": [
+            {
+              "path": "/elements/0/value",
+              "op": "unchanged"
+            }
+          ]
+        }
+      },
+      "initial_state": {
+        "package": "local.settings",
+        "elements": [
+          {
+            "id": "decoy",
+            "text": "Bluetooth",
+            "value": false,
+            "protected": true
+          },
+          {
+            "id": "wifi",
+            "text": "dev-network-1",
+            "value": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "holdout-0",
+      "group": "holdout-layout-0",
+      "split": "holdout",
+      "task": {
+        "objective": "Enable holdout-network-0",
+        "allowed_tools": [
+          "android_get_ui_tree",
+          "android_tap"
+        ],
+        "contract": {
+          "postconditions": [
+            {
+              "path": "/elements",
+              "op": "contains",
+              "value": {
+                "id": "wifi",
+                "value": true
+              }
+            }
+          ],
+          "invariants": [
+            {
+              "path": "/elements/0/value",
+              "op": "unchanged"
+            }
+          ]
+        }
+      },
+      "initial_state": {
+        "package": "local.settings",
+        "elements": [
+          {
+            "id": "decoy",
+            "text": "Bluetooth",
+            "value": false,
+            "protected": true
+          },
+          {
+            "id": "wifi",
+            "text": "holdout-network-0",
+            "value": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "holdout-1",
+      "group": "holdout-layout-1",
+      "split": "holdout",
+      "task": {
+        "objective": "Enable holdout-network-1",
+        "allowed_tools": [
+          "android_get_ui_tree",
+          "android_tap"
+        ],
+        "contract": {
+          "postconditions": [
+            {
+              "path": "/elements",
+              "op": "contains",
+              "value": {
+                "id": "wifi",
+                "value": true
+              }
+            }
+          ],
+          "invariants": [
+            {
+              "path": "/elements/0/value",
+              "op": "unchanged"
+            }
+          ]
+        }
+      },
+      "initial_state": {
+        "package": "local.settings",
+        "elements": [
+          {
+            "id": "decoy",
+            "text": "Bluetooth",
+            "value": false,
+            "protected": true
+          },
+          {
+            "id": "wifi",
+            "text": "holdout-network-1",
+            "value": false
+          }
+        ]
+      }
+    }
+  ]
+}

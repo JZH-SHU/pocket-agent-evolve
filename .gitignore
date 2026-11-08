@@ -1,0 +1,159 @@
+# 大模型文件
+*.gguf
+*.mmproj
+*.bin
+*.pt
+*.pth
+*.safetensors
+
+# 备份目录
+llama-backup/
+ollama-backup/
+
+# 测试图片和临时文件
+*.png
+*.jpg
+*.jpeg
+# 但允许文档截图
+!docs/screenshot-*
+
+# 模型目录
+暂时保留/
+框架/
+
+# ==============================================
+# Python通用忽略规则
+# ==============================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Environments
+.env
+.env.local
+.env.*.local
+.venv
+env/
+venv/
+ENV/
+
+# ==============================================
+# Project specific ignore rules for Pocket-Agent
+# ==============================================
+
+# MkDocs build output
+site/
+
+# Memory data (conversations, vector indexes)
+/memory/
+*.faiss
+*.index
+
+# Log files
+*.log
+logs/
+.runtime/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+CLAUDE.md
+.env.bak
+*.bak
+.startup_progress
+
+# Database & task files
+pocket_agent.db
+tasks/
+审查报告.md
+
+# SSH 相关（非核心功能，仅开发调试用）
+test_ssh_cmd.py
+同步代码到手动端-ssh机制.py
+docs/经验/08-ssh连接手机终端说明.md
+
+最新同步记录.txt
+termux指令.md
+2026-05-22-agent速度优化.md
+Pocket-Agent优化报告.md
+docs/memory-system-design.md
+审查报告.md
+
+# 测试脚本目录
+my_test_scripts/
+
+# Runtime secrets, transient DB sidecars, local agent settings and research caches
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+artifacts/
+graphify-out/
+.agents/
+.codex/
+.planning/
+agent/skills/auto-skills/
+agent/skills/candidates/
