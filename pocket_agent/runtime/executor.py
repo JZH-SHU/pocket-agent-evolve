@@ -30,6 +30,7 @@ class TaskSpec(BaseModel):
     max_steps: int = Field(default=12, ge=1, le=100)
     timeout: float = Field(default=30.0, gt=0, le=120)
     permission_mode: Literal["auto_safe", "plan", "default"] = "auto_safe"
+    learn: bool = True
 
     @model_validator(mode="after")
     def unique_tools(self):
@@ -60,15 +61,17 @@ class ExecutionState(TypedDict, total=False):
 
 class DurableExecutor:
     def __init__(self, services, backend, actor, *, actor_id: str, checkpoint_path: str | Path,
-                 lease_seconds: int = 90):
+                 lease_seconds: int = 90, curation_model=None, skill_id: str = ""):
         self.services, self.backend, self.actor = services, backend, actor
         self.actor_id, self.checkpoint_path = actor_id, str(checkpoint_path)
+        self.curation_model, self.skill_id = curation_model, skill_id
         self.lease_ms = lease_seconds * 1000
         self.ledger = ActionLedger(services.database)
         root = Path(__file__).resolve().parents[1]
         self.runtime_hash = canonical_hash({
             "sources": {path: hashlib.sha256((root / path).read_bytes()).hexdigest() for path in (
-                "runtime/executor.py", "runtime/backends.py", "runtime/ledger.py", "agents/contracts.py")},
+                "runtime/executor.py", "runtime/backends.py", "runtime/ledger.py", "agents/contracts.py",
+                "skills/acquisition.py", "skills/curator.py")},
             "langgraph": version("langgraph"), "checkpoint": version("langgraph-checkpoint-sqlite"),
         })
 
@@ -246,6 +249,12 @@ class DurableExecutor:
             result["tool_calls"] = sum(not e.get("read_only", False) for e in result.get("trace", []))
             if not result.get("usage_known", False):
                 result["tokens"] = None
+            from pocket_agent.skills.acquisition import acquire_skill
+            try:
+                result["learning"] = await acquire_skill(self.services, task, result, llm=self.curation_model,
+                                                         parent_skill_id=self.skill_id)
+            except Exception as exc:
+                result["learning"] = {"status": "failed", "reason": type(exc).__name__}
             artifact = self.services.artifacts.save_json(result, kind="executor-result", run_id=run_id)
             result["artifact"] = artifact
             if result["status"] == "completed":

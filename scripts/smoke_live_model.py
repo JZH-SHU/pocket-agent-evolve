@@ -20,6 +20,7 @@ def main():
     services = state_services(root / ".runtime" / run_id)
     request = RunRequest.model_validate_json((root / "examples/settings_task.json").read_text(encoding="utf-8"))
     request.task.max_steps = 2
+    request.task.learn = False  # Execution-only smoke must not add a drafting model call.
     actor, actor_id = load_actor()
     result = asyncio.run(execute_request(services, request, actor, actor_id, run_id))
     summary = {key: result.get(key) for key in ("verified", "status", "environment", "tool_calls", "tokens", "elapsed_ms", "error")}

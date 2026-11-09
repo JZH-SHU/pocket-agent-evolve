@@ -92,29 +92,21 @@ class SkillRepository:
         path.write_text(content, encoding="utf-8")
         digest = _hash(content)
         created = now_ms()
-        self.database.execute(
-            """
-            INSERT INTO skills(
-                id, display_name, description, status, current_version,
-                scope, source_run_id, content_path, content_hash,
-                suggested_action, merge_target, created_at, updated_at
-            ) VALUES (?, ?, ?, 'candidate', ?, 'project', ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                skill_id,
-                display_name,
-                description,
-                version,
-                source_run_id or None,
-                str(path),
-                digest,
-                suggested_action,
-                merge_target,
-                created,
-                created,
-            ),
-        )
-        self._snapshot(skill_id, version, content, evidence or [])
+        with self.database.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO skills(
+                    id, display_name, description, status, current_version,
+                    scope, source_run_id, content_path, content_hash,
+                    suggested_action, merge_target, created_at, updated_at
+                ) VALUES (?, ?, ?, 'candidate', ?, 'project', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (skill_id, display_name, description, version, source_run_id or None,
+                 str(path), digest, suggested_action, merge_target, created, created),
+            )
+            conn.execute("INSERT INTO skill_versions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (f"skill_version_{uuid.uuid4().hex}", skill_id, version, content, digest,
+                          Database.json_dumps(evidence or []), created))
         return self.get(skill_id) or {}
 
     def _snapshot(
@@ -196,6 +188,8 @@ class SkillRepository:
             return self._approve_verified(candidate=skill, evidence=evidence)
         if proposals or meta.get("rsi-managed") == "true":
             return self._approve_evolution(skill, evidence)
+        if any(item.get("type") == "acquisition_proposal" for item in evidence):
+            raise ValueError("acquired drafts must pass optimize/evaluation before first activation")
         target_dir = self.active_root / skill_id
         if target_dir.exists():
             raise FileExistsError(target_dir)
@@ -243,7 +237,8 @@ class SkillRepository:
         report = reports[-1]
         if (not report.get("eligible") or report.get("budget_exhausted", True) or report.get("errors")
                 or report.get("evaluator_hash") != evaluator_fingerprint()
-                or not compare(report.get("champion_dev", []), report.get("candidate_dev", []), require_gain=True)
+                or not compare(report.get("champion_dev", []), report.get("candidate_dev", []),
+                               require_gain=report.get("release_mode", "update") == "update")
                 or not compare(report.get("champion_holdout", []), report.get("candidate_holdout", []), require_gain=False)):
             raise ValueError("evaluation gate failed or evaluator changed")
         content = Path(candidate["content_path"]).read_text(encoding="utf-8")
@@ -255,11 +250,26 @@ class SkillRepository:
         consumed = self.database.fetch_one("SELECT * FROM evaluation_holdouts WHERE suite_hash=?", (report.get("suite_hash"),))
         if not consumed or consumed["candidate_hash"] != report["tested_body_hash"]:
             raise ValueError("frozen test provenance does not match")
+        seed = self.get(report.get("seed_id", report["champion_id"]))
+        if not seed or seed["status"] not in {"active", "candidate"}:
+            raise ValueError("seed lineage changed")
+        seed_content = Path(seed["content_path"]).read_text(encoding="utf-8")
+        if text_hash(seed_content) != report.get("seed_hash", report["champion_hash"]):
+            raise ValueError("seed changed since evaluation")
+        seed_meta, _ = parse_frontmatter(seed_content)
+        tools = {t for t in meta.get("allowed-tools", "").split(",") if t}
+        seed_tools = {t for t in seed_meta.get("allowed-tools", "").split(",") if t}
+        if not tools or not tools <= seed_tools or sorted(tools) != report.get("permissions"):
+            raise ValueError("skill permissions changed")
+        if report.get("release_mode") == "initial":
+            if seed["status"] != "candidate" or candidate["merge_target"] != seed["id"] or seed["merge_target"]:
+                raise ValueError("initial release lineage changed")
+            updated = self._activate_verified(seed["id"], content, evidence, report["seed_hash"], candidate["id"])
+            return {**updated, "released_candidate": candidate["id"], "validation_environment": report["environment"]}
         parent = self.get(report["champion_id"])
         if not parent or parent["status"] != "active" or parent["id"] != candidate["merge_target"]:
             raise ValueError("baseline lineage changed")
         parent_meta, _ = parse_frontmatter(Path(parent["content_path"]).read_text(encoding="utf-8"))
-        tools = {t for t in meta.get("allowed-tools", "").split(",") if t}
         old_tools = {t for t in parent_meta.get("allowed-tools", "").split(",") if t}
         if not tools or not tools <= old_tools or sorted(tools) != report.get("permissions"):
             raise ValueError("skill permissions changed")
@@ -349,6 +359,28 @@ class SkillRepository:
         if path.read_text(encoding="utf-8") != content:
             raise ValueError("immutable skill content is corrupt")
         return path
+
+    def _activate_verified(self, skill_id: str, content: str, evidence: list[dict],
+                           expected_hash: str, archive_candidate: str) -> dict:
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM skills WHERE id=?", (skill_id,)).fetchone()
+            if not row or row["status"] != "candidate" or row["content_hash"] != expected_hash or row["merge_target"]:
+                raise ValueError("seed changed before activation")
+            if _hash(Path(row["content_path"]).read_text(encoding="utf-8")) != expected_hash:
+                raise ValueError("seed file changed before activation")
+            meta, body = parse_frontmatter(content)
+            meta.update(name=skill_id, version="0.1.0", status="active")
+            rendered = format_frontmatter(meta, body)
+            path = self._immutable_content(skill_id, rendered)
+            conn.execute("UPDATE skills SET status='active',content_path=?,content_hash=?,activated_at=?,updated_at=? "
+                         "WHERE id=? AND status='candidate' AND content_hash=?",
+                         (str(path), _hash(rendered), now_ms(), now_ms(), skill_id, expected_hash))
+            conn.execute("UPDATE skill_versions SET content=?,content_hash=?,evidence_json=? WHERE skill_id=? AND version='0.1.0'",
+                         (rendered, _hash(rendered), Database.json_dumps(evidence), skill_id))
+            conn.execute("UPDATE skills SET status='archived',updated_at=? WHERE id=? AND status='candidate'",
+                         (now_ms(), archive_candidate))
+        return self.get(skill_id) or {}
 
     def _update_active(self, skill_id: str, content: str, evidence: list[dict[str, Any]] | None,
                        *, expected_hash: str | None = None, archive_candidate: str = "") -> dict[str, Any]:

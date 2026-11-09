@@ -13,7 +13,8 @@ ROOT_FILES = ("README.md", "LICENSE", "SECURITY.md", "THIRD_PARTY_NOTICES.md", "
               "pyproject.toml", "requirements.txt", "uv.lock", "main.py", "app.py")
 PATTERNS = ("pocket_agent/**/*.py", "agent/*.py", "agent/prompts/*.py", "agent/tools/*.py", "tests/*.py",
             "examples/*.json", "examples/*.md", ".github/workflows/*.yml")
-EXTRA_FILES = ("docs/UPGRADE_REPORT_0.3.md", "docs/ENGINEERING.md", "docs/VALIDATION_0.3.json", "scripts/prepare_release.py", "scripts/smoke_live_model.py")
+EXTRA_FILES = ("docs/UPGRADE_REPORT_0.3.md", "docs/UPGRADE_REPORT_0.4.md", "docs/ENGINEERING.md",
+               "docs/VALIDATION_0.3.json", "docs/VALIDATION_0.4.json", "scripts/prepare_release.py", "scripts/smoke_live_model.py")
 SECRET_PATTERNS = (r"sk-[A-Za-z0-9_-]{24,}", r"gh[pousr]_[A-Za-z0-9]{30,}", r"github_pat_[A-Za-z0-9_]{30,}",
                    r"AKIA[A-Z0-9]{16}", r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 
@@ -46,7 +47,7 @@ def main():
             stream.write(path.read_text(encoding="utf-8").replace("\r\n", "\n"))
         raw = target.read_bytes()
         manifest.append({"path": relative.as_posix(), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()})
-    public_manifest = {"version": "0.3.0", "files": manifest,
+    public_manifest = {"version": "0.4.0", "files": manifest,
                        "scope": "Allowlisted source; runtime data and third-party assets excluded"}
     (destination / "RELEASE_MANIFEST.json").write_text(json.dumps(public_manifest, indent=2) + "\n", encoding="utf-8")
     private_manifest = {"root": str(destination), **public_manifest}

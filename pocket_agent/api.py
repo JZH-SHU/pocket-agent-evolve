@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
-from pocket_agent.cli import RunRequest, load_actor, make_backend, skill_body, state_services
+from pocket_agent.cli import RunRequest, continue_learning, load_actor, make_backend, skill_body, state_services
 from pocket_agent.runtime.executor import DurableExecutor
 from pocket_agent.storage.database import now_ms
 
@@ -41,11 +41,11 @@ def create_app(state_dir: Path | None = None, *, actor_factory=load_actor) -> Fa
             task.cancel()
         await asyncio.gather(*pending.values(), return_exceptions=True)
 
-    app = FastAPI(title="PocketAgent Evolve", version="0.3.0", lifespan=lifespan)
+    app = FastAPI(title="PocketAgent Evolve", version="0.4.0", lifespan=lifespan)
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "version": "0.3.0"}
+        return {"status": "ok", "version": "0.4.0"}
 
     async def schedule(request: RunRequest, run_id: str, resume: bool):
         if run_id in pending and not pending[run_id].done():
@@ -55,7 +55,8 @@ def create_app(state_dir: Path | None = None, *, actor_factory=load_actor) -> Fa
             backend = await make_backend(services, request, run_id)
             body = skill_body(services, request.skill_id, request.task.allowed_tools)
             executor = DurableExecutor(services, backend, actor, actor_id=actor_id,
-                                      checkpoint_path=directory / "checkpoints.db")
+                                      checkpoint_path=directory / "checkpoints.db", curation_model=actor,
+                                      skill_id=request.skill_id)
             if not resume:
                 executor.submit(request.task, skill=body, run_id=run_id)
             elif not services.runs.get_run(run_id):
@@ -65,7 +66,8 @@ def create_app(state_dir: Path | None = None, *, actor_factory=load_actor) -> Fa
 
         async def execute():
             try:
-                await executor.run(request.task, skill=body, run_id=run_id, resume=True)
+                result = await executor.run(request.task, skill=body, run_id=run_id, resume=True)
+                await continue_learning(services, request, result, actor, actor_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -92,7 +94,24 @@ def create_app(state_dir: Path | None = None, *, actor_factory=load_actor) -> Fa
         if not run:
             raise HTTPException(404, "Unknown task")
         run["actions"] = services.database.fetch_all("SELECT * FROM action_ledger WHERE run_id=?", (run_id,))
+        acquisition = services.database.fetch_one("SELECT decision_json FROM skill_acquisitions WHERE run_id=?", (run_id,))
+        if acquisition:
+            import json
+            run["learning"] = json.loads(acquisition["decision_json"])
         return run
+
+    @app.get("/v3/skills", dependencies=[Depends(authorize)])
+    async def list_skills():
+        return services.skills.list()
+
+    @app.post("/v3/skills/{skill_id}/approve", dependencies=[Depends(authorize)])
+    async def approve_skill(skill_id: str):
+        try:
+            return services.skills.approve(skill_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Unknown candidate") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.post("/v3/approvals/{approval_id}", dependencies=[Depends(authorize)])
     async def approve(approval_id: str, request: ApprovalRequest):

@@ -57,7 +57,7 @@ class DatabaseAndRunTests(RuntimeCase):
         migrations = self.services.database.fetch_all(
             "SELECT version FROM schema_migrations ORDER BY version"
         )
-        self.assertEqual([row["version"] for row in migrations], [1, 2])
+        self.assertEqual([row["version"] for row in migrations], [1, 2, 3])
         with self.services.database.connection() as conn:
             mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         self.assertEqual(mode.lower(), "wal")

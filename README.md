@@ -2,9 +2,9 @@
 
 **Verified outcomes · durable execution · evidence-gated skill evolution**
 
-PocketAgent Evolve is a local-first Android-tool agent and evaluation runtime. Version 0.3 moves the project toward verifiable execution: one LangGraph executor is shared by deployment and skill trials, declarative state contracts determine success, and a durable action ledger prevents blind replay of uncertain writes.
+PocketAgent Evolve is a local-first Android-tool agent and evaluation runtime. Version 0.4 connects verified execution to skill acquisition, isolated GEPA optimization, first publication and subsequent upgrades. One LangGraph executor is shared by deployment and skill trials, declarative state contracts determine success, and a durable action ledger prevents blind replay of uncertain writes.
 
-中文升级说明、研究依据与实现边界：[升级报告](docs/UPGRADE_REPORT_0.3.md) · [工程与面试说明](docs/ENGINEERING.md)
+中文升级说明、研究依据与实现边界：[0.4 全链路升级报告](docs/UPGRADE_REPORT_0.4.md) · [0.3 报告](docs/UPGRADE_REPORT_0.3.md) · [工程与面试说明](docs/ENGINEERING.md)
 
 ## Implemented
 
@@ -14,6 +14,7 @@ PocketAgent Evolve is a local-first Android-tool agent and evaluation runtime. V
 | Recovery | LangGraph SQLite checkpoints, job/device leases, stable execution identity | Resume requires the original runtime, actor, task, skill and tool schema |
 | Uncertain actions | Intent/result ledger, reuse confirmed results | No claim of exactly-once external GUI actions |
 | MCP | Official Python SDK 2.3, modern/legacy integration tests | Device server remains external |
+| Skill acquisition | Verified deployment trace -> redacted, validated draft; persistent deduplication and crash recovery | Rule-based eligibility is not proof of general usefulness; acquired drafts cannot activate directly |
 | Skill search | GEPA 0.1.4 with shared executor, train/dev and one-use frozen holdout | No bundled Android or model-learning performance claims |
 | Version lifecycle | Immutable content, transactional active pointer, baseline CAS, rollback | Automatic promotion limited to repeated local-fixture validation |
 | Device evaluation | Explicit MCP reset actions and reset contracts | Operator must enable repeated device actions |
@@ -28,10 +29,11 @@ Python **3.11+**; development verification uses Python 3.12.
 ```bash
 uv sync --frozen --extra evolve --extra test
 uv run --frozen --extra evolve python -m pocket_agent demo
+uv run --frozen --extra evolve python -m pocket_agent demo-learning
 uv run --frozen --extra evolve --extra test python -m unittest discover -s tests -v
 ```
 
-Or activate a virtual environment and run `pip install -e ".[evolve,test]"`. The scripted demo needs no API key or phone and uses temporary state.
+Or activate a virtual environment and run `pip install -e ".[evolve,test]"`. Both scripted demos need no API key or phone and use temporary state. `demo-learning` executes acquisition, the actual GEPA library and first publication; its script already solves the fixture, so publication demonstrates qualification, not learning improvement. All generated skills are discarded on exit.
 
 ## Run a real model
 
@@ -64,6 +66,27 @@ A screenshot or a tool name alone never proves completion. Unknown delivery stop
 
 ## GEPA skill evolution
 
+By default `task.learn: true` considers verified deployment traces for acquisition. It skips no-op, failed and insufficient traces, deduplicates the redacted procedure, and creates a reviewable seed. Set `task.learn: false` to opt out. Evaluations always disable acquisition. Drafting may make one additional, bounded model call; unavailable/invalid drafting falls back to a clearly marked deterministic template. Task token usage and acquisition usage are separate; missing usage stays unknown.
+
+An acquired seed is not active and cannot bypass evaluation with `approve`. Optimize it directly:
+
+```bash
+python -m pocket_agent optimize --skill ACQUIRED_SEED_ID --suite examples/settings_suite.json
+python -m pocket_agent approve EVALUATED_CANDIDATE_ID
+```
+
+New seeds qualify against the same actor with an empty Skill, then the one-use holdout; an already-good unchanged seed can qualify without an artificial rewrite. Updates compare against the active target and require dev improvement. Acquiring from an active Skill records an update target. The acquisition example itself is rejected from dev/holdout (exact objective/state match); semantic near-duplicates still need operator review. No seed is activated during search.
+
+For one command to continue from a deployment into bounded optimization, see `examples/settings_learning_task.json`:
+
+```bash
+python -m pocket_agent run examples/settings_learning_task.json --run-id learn-settings-001
+```
+
+The optional `optimization` object includes the operator-supplied suite, budgets and `auto_promote`. It runs only after a new seed is acquired; ordinary tasks without this object only draft, never start GEPA. The example authorizes local-fixture promotion. Device trials require `allow_device_eval: true` and cannot auto-promote. Progress is stored under the task's `learning.optimization`; resume reuses a completed stage and never silently restarts an interrupted search or reuses its holdout. For a new attempt, explicitly optimize the original seed with a fresh acceptance suite.
+
+Manual baseline imports remain available:
+
 ```bash
 python -m pocket_agent import-skill examples/settings_skill.md --activate
 python -m pocket_agent optimize --skill settings-toggle \
@@ -90,10 +113,12 @@ Every route below requires `Authorization: Bearer <POCKET_ADMIN_TOKEN>`. Only `/
 |---|---|---|
 | POST | `/v3/tasks` | Persist and schedule a contracted task |
 | GET | `/v3/tasks/{run_id}` | Read durable run state and action ledger |
+| GET | `/v3/skills` | List acquired seeds, evaluated candidates and active skills |
+| POST | `/v3/skills/{skill_id}/approve` | Publish an evaluated candidate through the same repository gates |
 | POST | `/v3/tasks/{run_id}/resume` | Resume with the same request and execution identity |
 | POST | `/v3/approvals/{approval_id}` | Decide a run-scoped approval |
 
-HTTP disconnect does not cancel execution. After process restart explicitly resume; a crashed worker's lease must expire before another worker can claim its device. Runtime state defaults to `.runtime/pocket`.
+HTTP disconnect does not cancel execution. Task status and learning status are separate: a completed task may still be optimizing, or its learning stage may fail. Check `learning.optimization.status` for publication. After process restart explicitly resume; a crashed worker's lease must expire before another worker can claim its device. Runtime state defaults to `.runtime/pocket`. Execution identity changes across the 0.3 -> 0.4 upgrade; old task checkpoints are not silently replayed under new code.
 
 ## Architecture and research
 
@@ -122,6 +147,6 @@ flowchart LR
 
 ## Legacy and license
 
-The original `main.py`, `app.py` and `agent/` Python integration remain for compatibility. The supported 0.3 entry points are `python -m pocket_agent` and `pocket_agent.api`. Legacy tasks without contracts are now unverified. Historical 3D assets, external Skill packs and private generated skills are excluded from the clean release; the 3D frontend is not a release feature.
+The original `main.py`, `app.py` and `agent/` Python integration remain for compatibility. The supported 0.4 entry points are `python -m pocket_agent` and `pocket_agent.api`. Legacy tasks without contracts are now unverified. Historical 3D assets, external Skill packs and private generated skills are excluded from the clean release; the 3D frontend is not a release feature.
 
 MIT for repository code; model, dataset and dependency licenses remain separate. See [third-party notices](THIRD_PARTY_NOTICES.md) and [security boundaries](SECURITY.md). Databases, logs, keys, private memory and machine-specific research reports are excluded from publication.

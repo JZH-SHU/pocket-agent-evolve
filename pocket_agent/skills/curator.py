@@ -134,6 +134,7 @@ class SkillCurator:
         steps: list[dict[str, Any]],
         trace: list[dict[str, Any]],
         verification: VerificationEvidence,
+        provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """
         Hybrid curation pipeline:
@@ -181,6 +182,7 @@ class SkillCurator:
             draft=draft,
             generation_method=generation_method,
             quality_warnings=quality_warnings,
+            provenance=provenance,
         )
 
     def _extract_material(
@@ -400,7 +402,7 @@ class SkillCurator:
                     title=f"步骤 {item['order']}",
                     action=str(item["description"]),
                     verification=str(verification),
-                    on_failure="重新读取当前 UI 状态后只重试一次，仍失败则停止。",
+                    on_failure="先重新观察；写操作结果未知时停止，不盲目重试。",
                 )
             )
         failures = material.failure_signals or [
@@ -435,6 +437,7 @@ class SkillCurator:
         draft: SkillDraft,
         generation_method: str,
         quality_warnings: list[str],
+        provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         similar = self.repository.find_similar(
             f"{draft.display_name} {draft.description}"
@@ -463,6 +466,8 @@ class SkillCurator:
                 "quality_warnings": quality_warnings,
             },
         ]
+        if provenance:
+            evidence.append(provenance)
         candidate = self.repository.create_candidate(
             name=stable_name,
             display_name=draft.display_name,

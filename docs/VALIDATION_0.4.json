@@ -1,0 +1,46 @@
+{
+  "version": "0.4.0",
+  "date": "2026-11-09",
+  "platform": "Windows local",
+  "python": "3.12.12",
+  "versions": {
+    "pocket-agent": "0.4.0",
+    "langgraph": "1.2.20",
+    "langgraph-checkpoint-sqlite": "3.1.3",
+    "mcp": "2.3.0",
+    "gepa": "0.1.4",
+    "pydantic": "2.14.3",
+    "fastapi": "0.162.2"
+  },
+  "tests": {
+    "command": "python -m unittest discover -s tests -v",
+    "passed": 63,
+    "failed": 0,
+    "seconds": 88.468
+  },
+  "scripted_lifecycle": {
+    "actual_gepa_library": true,
+    "fixture": true,
+    "task_to_acquisition_to_first_release": true,
+    "learning_gain_claimed": false
+  },
+  "clean_snapshot_validation": {
+    "status": "passed",
+    "installed_in_separate_virtualenv": true,
+    "tests_passed": 63,
+    "failed": 0,
+    "seconds": 88.367,
+    "demo_learning": "published initial version 0.1.0 in temporary state",
+    "uses_private_runtime_files": false
+  },
+  "real_model": {
+    "attempted_this_upgrade": false,
+    "prior_smoke": "OpenAIAuthenticationError"
+  },
+  "real_device": {
+    "tested": false
+  },
+  "github_ci": {
+    "status": "configured_not_yet_checked_for_this_commit"
+  }
+}

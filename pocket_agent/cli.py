@@ -10,14 +10,31 @@ import tempfile
 from types import SimpleNamespace
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from pocket_agent.bootstrap import get_runtime_services
+from pocket_agent.agents.contracts import canonical_hash
 from pocket_agent.evaluation.harness import BenchmarkRunner, BenchmarkSuite, summarize
 from pocket_agent.runtime.backends import FixtureBackend, MCPBackend
 from pocket_agent.runtime.executor import DurableExecutor, TaskSpec
 from pocket_agent.skills.frontmatter import parse_frontmatter
 from pocket_agent.skills.optimization import GEPASkillOptimizer
+
+
+class OptimizationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    suite: BenchmarkSuite
+    max_metric_calls: int = Field(default=40, ge=4, le=1000)
+    max_actor_calls: int = Field(default=500, ge=1, le=5000)
+    max_reflections: int = Field(default=20, ge=1, le=100)
+    auto_promote: bool = False
+    allow_device_eval: bool = False
+
+    @model_validator(mode="after")
+    def device_scope(self):
+        if self.suite.environment == "mcp_device" and (not self.allow_device_eval or self.auto_promote):
+            raise ValueError("device trials need allow_device_eval; automatic device promotion is disabled")
+        return self
 
 
 class RunRequest(BaseModel):
@@ -26,6 +43,13 @@ class RunRequest(BaseModel):
     initial_state: dict = Field(default_factory=dict)
     backend: str = "fixture"
     skill_id: str = ""
+    optimization: OptimizationRequest | None = None
+
+    @model_validator(mode="after")
+    def learning_scope(self):
+        if self.optimization and not self.task.learn:
+            raise ValueError("optimization after a task requires learning enabled")
+        return self
 
 
 def state_services(directory: Path):
@@ -79,18 +103,67 @@ async def make_backend(services, request: RunRequest, run_id: str):
 class DemoActor:
     """Explicit scripted smoke actor, not model learning or benchmark evidence."""
     async def ainvoke(self, prompt):
+        if not prompt.startswith("{"):
+            return SimpleNamespace(content="{}")  # Deterministic Curator fallback, no hidden model call.
         data = json.loads(prompt)
         matches = [e for e in data["observation"]["elements"] if e["text"] in data["objective"]]
         action = {"tool": "android_tap", "arguments": {"element_id": matches[0]["id"]}} if len(matches) == 1 else {"tool": "finish"}
         return SimpleNamespace(content=json.dumps(action))
+
+    def invoke(self, prompt):
+        return "Observe state; find the element whose text matches the objective; tap only if needed."
 
 
 async def execute_request(services, request: RunRequest, actor, actor_id: str, run_id: str, *, resume=False):
     backend = await make_backend(services, request, run_id)
     body = skill_body(services, request.skill_id, request.task.allowed_tools)
     executor = DurableExecutor(services, backend, actor, actor_id=actor_id,
-                              checkpoint_path=services.artifacts.root.parent / "checkpoints.db")
-    return await executor.run(request.task, skill=body, run_id=run_id, resume=resume)
+                              checkpoint_path=services.artifacts.root.parent / "checkpoints.db",
+                              curation_model=actor, skill_id=request.skill_id)
+    result = await executor.run(request.task, skill=body, run_id=run_id, resume=resume)
+    return await continue_learning(services, request, result, actor, actor_id)
+
+
+async def continue_learning(services, request: RunRequest, result: dict, actor, actor_id: str) -> dict:
+    """Optional, explicitly budgeted acquisition -> optimization -> release stage."""
+    spec = request.optimization
+    if spec is None:
+        return result
+    learning = result.get("learning", {})
+    if learning.get("status") != "candidate":
+        result["optimization"] = {"status": "skipped", "reason": "no_new_seed"}
+        return result
+    db, run_id = services.database, result["run_id"]
+    digest = canonical_hash({"config": spec.model_dump(), "actor_id": actor_id})
+    with db.connection() as conn:
+        row = conn.execute("SELECT * FROM skill_acquisitions WHERE run_id=?", (run_id,)).fetchone()
+        saved = json.loads(row["decision_json"])
+        previous = saved.get("optimization")
+        if previous:
+            result["optimization"] = previous if previous["config_hash"] == digest else {
+                "status": "refused", "reason": "optimization_config_changed"}
+            return result
+        stage = {"status": "running", "config_hash": digest}
+        saved["optimization"] = stage
+        conn.execute("UPDATE skill_acquisitions SET decision_json=? WHERE run_id=?", (db.json_dumps(saved), run_id))
+    try:
+        backend_factory = None
+        if spec.suite.environment == "mcp_device":
+            async def backend_factory(case, trial_id):
+                return await make_backend(services, RunRequest(task=case.task, backend="mcp"), trial_id)
+        optimizer = GEPASkillOptimizer(services, actor, lambda prompt: actor.invoke(prompt), actor_id=actor_id,
+            max_actor_calls=spec.max_actor_calls, max_reflections=spec.max_reflections, backend_factory=backend_factory)
+        report = await asyncio.to_thread(optimizer.optimize, learning["candidate_id"], spec.suite,
+                                        max_metric_calls=spec.max_metric_calls, auto_promote=spec.auto_promote)
+        stage = {**stage, "status": "published" if report.get("release") else "evaluated",
+                 **{key: report[key] for key in ("eligible", "reason", "candidate_id", "release_mode", "metrics", "artifact")},
+                 "release": report.get("release")}
+    except Exception as exc:
+        stage = {**stage, "status": "failed", "reason": type(exc).__name__}
+    saved["optimization"] = stage
+    db.execute("UPDATE skill_acquisitions SET decision_json=? WHERE run_id=?", (db.json_dumps(saved), run_id))
+    result["optimization"] = stage
+    return result
 
 
 def main():
@@ -98,6 +171,7 @@ def main():
     parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("POCKET_STATE_DIR", ".runtime/pocket")))
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("demo", help="isolated scripted smoke test, no model/device")
+    sub.add_parser("demo-learning", help="scripted task -> draft -> real GEPA -> first publication; isolated temporary state")
     run = sub.add_parser("run", help="run a contracted task with the configured real model")
     run.add_argument("request", type=Path)
     run.add_argument("--run-id", default="")
@@ -124,7 +198,7 @@ def main():
     evaluate.add_argument("--skill", default="")
     evaluate.add_argument("--allow-device-eval", action="store_true")
     args = parser.parse_args()
-    if args.command == "demo":
+    if args.command in {"demo", "demo-learning"}:
         args.state_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=args.state_dir, prefix="demo-") as directory:
             services = state_services(Path(directory))
@@ -134,9 +208,28 @@ def main():
                 initial_state={"package": "local.settings", "elements": [
                     {"id": "decoy", "text": "Bluetooth", "value": False, "protected": True},
                     {"id": "wifi", "text": "Wi-Fi", "value": False}]})
+            if args.command == "demo-learning":
+                cases = []
+                for split in ("train", "dev", "holdout"):
+                    for index in range(2):
+                        label = f"{split}-network-{index}"
+                        state = json.loads(json.dumps(request.initial_state))
+                        state["elements"][1]["text"] = label
+                        cases.append({"id": f"{split}-{index}", "group": f"{split}-{index}", "split": split,
+                                      "task": request.task.model_copy(update={"objective": f"Enable {label}"}),
+                                      "initial_state": state})
+                suite = BenchmarkSuite(name="scripted-lifecycle-demo", cases=cases)
+                request.optimization = OptimizationRequest(suite=suite, max_metric_calls=16,
+                                                           max_actor_calls=150, auto_promote=True)
             result = asyncio.run(execute_request(services, request, DemoActor(), "scripted-demo", "demo"))
-            output = {key: result.get(key) for key in ("verified", "status", "environment", "actor_id", "tool_calls", "tokens")}
+            output = {key: result.get(key) for key in ("verified", "status", "environment", "actor_id", "tool_calls", "tokens", "learning")}
             output["scope"] = "scripted integration smoke; not LLM learning or Android performance"
+            output["candidate_persisted"] = False
+            if "optimization" in result:
+                output["optimization"] = {key: result["optimization"].get(key) for key in
+                                           ("status", "eligible", "release_mode", "reason", "candidate_id")}
+                release = result["optimization"].get("release") or {}
+                output["active_skill"] = {key: release.get(key) for key in ("id", "current_version", "status")}
             print(json.dumps(output, ensure_ascii=False, indent=2))
         return
     from dotenv import load_dotenv

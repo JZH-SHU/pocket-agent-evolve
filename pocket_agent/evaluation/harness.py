@@ -40,7 +40,7 @@ class BenchmarkSuite(BaseModel):
                 if case.reset_contract is None:
                     raise ValueError("device evaluation requires an explicit reset contract")
                 OutcomeContract.model_validate(case.reset_contract)
-            digest = canonical_hash({"task": case.task.model_dump(), "state": case.initial_state})
+            digest = canonical_hash({"task": case.task.model_dump(exclude={"learn"}), "state": case.initial_state})
             if case.id in ids or case.group in groups and groups[case.group] != case.split:
                 raise ValueError("case ids must be unique and groups cannot cross splits")
             if digest in examples and examples[digest] != case.split:
@@ -101,7 +101,8 @@ class BenchmarkRunner:
                         if not reset.evaluate(await backend.observe(), before)[0]:
                             raise ValueError("reset contract not satisfied")
                 result = await DurableExecutor(self.services, backend, self.actor, actor_id=self.actor_id,
-                    checkpoint_path=self.checkpoint_path).run(case.task, skill=skill, run_id=run_id)
+                    checkpoint_path=self.checkpoint_path).run(case.task.model_copy(update={"learn": False}),
+                                                             skill=skill, run_id=run_id)
                 trials.append({**result, "case_id": case.id, "group": case.group,
                     "split": case.split, "repetition": repetition,
                     "violations": int(result["status"] == "outcome_unknown" or "invariant:" in result.get("error", "")),

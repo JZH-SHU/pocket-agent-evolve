@@ -1,5 +1,5 @@
 {
-  "version": "0.3.0",
+  "version": "0.4.0",
   "files": [
     {
       "path": ".env.example",
@@ -13,8 +13,8 @@
     },
     {
       "path": ".github/workflows/ci.yml",
-      "bytes": 585,
-      "sha256": "fd514b406ccbc99feaa3b963c133eb82ca3b5785155569e499f571cf90fb90fb"
+      "bytes": 666,
+      "sha256": "bf2d00b1c74bcc2a65fed844dc751d6baaeff065939acb61dd97e74b16d015b2"
     },
     {
       "path": ".gitignore",
@@ -113,8 +113,8 @@
     },
     {
       "path": "docs/ENGINEERING.md",
-      "bytes": 5917,
-      "sha256": "80fdc64885d646fa6de6ef28b2fba7974aa98a994abd6a045dcd686b0e3ff9fb"
+      "bytes": 8064,
+      "sha256": "0f32af3c35fa89bc7c27bb05dad9d7c75204fe00bce125a316579671e4c4180e"
     },
     {
       "path": "docs/UPGRADE_REPORT_0.3.md",
@@ -122,9 +122,24 @@
       "sha256": "ed34ff9b8051718ca0a9c84fd112094e8fa4414015f31756d74eda9ae47b1c86"
     },
     {
+      "path": "docs/UPGRADE_REPORT_0.4.md",
+      "bytes": 5812,
+      "sha256": "0e2507042feaf996cbeefbbba8730f0d4951b9febdd4e7380af58c8f1917fddf"
+    },
+    {
       "path": "docs/VALIDATION_0.3.json",
       "bytes": 1295,
       "sha256": "2141489df57d589fc21798aedac8482e84e462397b97d1f44e6a421d4a2b8931"
+    },
+    {
+      "path": "docs/VALIDATION_0.4.json",
+      "bytes": 1138,
+      "sha256": "0a7a9aa670a50c4fca84867728c5d6182831b77ceed85a15db12f257635b7869"
+    },
+    {
+      "path": "examples/settings_learning_task.json",
+      "bytes": 8342,
+      "sha256": "b96c6460bb34fe11f3364c6292c00e4a9a8cc9f997acc567a5b3c488c854845b"
     },
     {
       "path": "examples/settings_skill.md",
@@ -178,8 +193,8 @@
     },
     {
       "path": "pocket_agent/api.py",
-      "bytes": 4417,
-      "sha256": "0766e716cca09a25568d4a463244582727049ae69d326779ef7f0cc35f5fa46d"
+      "bytes": 5371,
+      "sha256": "bc6ed7d969da2fe668acb47bf6c965f6d35a425fbaf96e6776e2754fac46cfd5"
     },
     {
       "path": "pocket_agent/bootstrap.py",
@@ -188,8 +203,8 @@
     },
     {
       "path": "pocket_agent/cli.py",
-      "bytes": 10364,
-      "sha256": "3b9fd201767f7bf0005a74967239fc908fba2b96739fb94772ed6711cac46596"
+      "bytes": 15893,
+      "sha256": "ade74d60deea6c0e328942456f15b6a9e17f33daa0ab93a12a366788fb358e95"
     },
     {
       "path": "pocket_agent/evaluation/__init__.py",
@@ -198,8 +213,8 @@
     },
     {
       "path": "pocket_agent/evaluation/harness.py",
-      "bytes": 6674,
-      "sha256": "22d17262fe20bee104713d45caa53efb2e63c6c947e89104c969a90d4f5b30d0"
+      "bytes": 6788,
+      "sha256": "94e4dba4aff8ddec077d9a29553514f06d2763bbc815737a131135c9944771c1"
     },
     {
       "path": "pocket_agent/mcp/__init__.py",
@@ -253,8 +268,8 @@
     },
     {
       "path": "pocket_agent/runtime/executor.py",
-      "bytes": 16151,
-      "sha256": "c80b092a7b5a73726e7f7be57589cfd9ae026cda2aa723443955503aaed540b2"
+      "bytes": 16758,
+      "sha256": "d50046f9b51480e2a6599ece6c3ec5caab36a97ffedf475a8f1407ac534c458d"
     },
     {
       "path": "pocket_agent/runtime/interaction.py",
@@ -282,9 +297,14 @@
       "sha256": "55e724ecc8435f27c906543c9520e33f0f23ea84d1dcce50929ffe9fd152d8a6"
     },
     {
+      "path": "pocket_agent/skills/acquisition.py",
+      "bytes": 5287,
+      "sha256": "e56ca7c716eba1d552c1e545a5b9a7b90c68a79d83fc815d0e1f3730d2c6ac72"
+    },
+    {
       "path": "pocket_agent/skills/curator.py",
-      "bytes": 21536,
-      "sha256": "48509b2a081e49d007952c70bc0043c53b35d5806af112a45242df48e49e18dd"
+      "bytes": 21733,
+      "sha256": "e0bd8df6203595762f2f4eabd1adbd6e81083621d0ea6dc8716d7caa803e4827"
     },
     {
       "path": "pocket_agent/skills/evaluation.py",
@@ -308,13 +328,13 @@
     },
     {
       "path": "pocket_agent/skills/optimization.py",
-      "bytes": 9528,
-      "sha256": "6b765dd0af8d6f09d95682274f53aef96a80cf3f6b11ad3491807d4971c2b59b"
+      "bytes": 11419,
+      "sha256": "7da7c9b6b333d9597aa81aeb1cc97ba7490267aefc55a2d2e1da31e735a899ef"
     },
     {
       "path": "pocket_agent/skills/repository.py",
-      "bytes": 21357,
-      "sha256": "19a35ecbaa242696a2111bc02d0af43b707c2feb4a60faccc7666fe91f365c25"
+      "bytes": 24568,
+      "sha256": "f3aaaf73e88530cd41d9be7a43810dcf46c694593064688f8b3e3a85e0e2a6c1"
     },
     {
       "path": "pocket_agent/skills/rsi.py",
@@ -328,8 +348,8 @@
     },
     {
       "path": "pocket_agent/storage/database.py",
-      "bytes": 14424,
-      "sha256": "bb0292a5f5e0030d1cb258c0f47a7b60ca1865b3eac65dc9bc30bbf431d4df9d"
+      "bytes": 15239,
+      "sha256": "4ce115ff4598ce057531c7c0693b0c8df91c12a216e7dfa365ce1b91093a0edf"
     },
     {
       "path": "pocket_agent/tools/__init__.py",
@@ -354,12 +374,12 @@
     {
       "path": "pyproject.toml",
       "bytes": 1683,
-      "sha256": "c5d3fb983993e5c916599e1acbe625d744689fdb5cf1848c6f9fc889c5546302"
+      "sha256": "142bb06b6e91df146c6d72e81e951d87efee2808747f02753bfa815710dc8781"
     },
     {
       "path": "README.md",
-      "bytes": 7404,
-      "sha256": "474424302468a3c843b449d88e1f9aed4877e5ce08ef5cc189b8e5db92ea3298"
+      "bytes": 10635,
+      "sha256": "ed9c95ca37d998c3871f207ae92ca1b08f5f83cb03e4ff90f381810f974e5717"
     },
     {
       "path": "requirements.txt",
@@ -368,18 +388,18 @@
     },
     {
       "path": "scripts/prepare_release.py",
-      "bytes": 3354,
-      "sha256": "42f46df7f1710b75780d9b9550c2cf7d20955c4f0dfba582300e66b35867b234"
+      "bytes": 3427,
+      "sha256": "7774ce742fb78bfc2cb8f8495537b0641fefafe525f873e195bf5231a273f714"
     },
     {
       "path": "scripts/smoke_live_model.py",
-      "bytes": 1353,
-      "sha256": "f7c69e7e207ab64c9aa3a96ae08a2206b3ec5ac61ae9a3c857d73685efb097d7"
+      "bytes": 1444,
+      "sha256": "2c31a865f06bb4e2b75647a290d00d4d924dbbee20fd5aeb837fe492dc18a637"
     },
     {
       "path": "SECURITY.md",
-      "bytes": 1134,
-      "sha256": "f06f92fa0c8b0e87869e8e4c4b40916355ba64dd915b4a4f48090fbb8c9b4b84"
+      "bytes": 1594,
+      "sha256": "420b4bc5119bcbe061ac3b76190bfe6181586f94191a15c82effbf371d58e231"
     },
     {
       "path": "tests/__init__.py",
@@ -413,13 +433,18 @@
     },
     {
       "path": "tests/test_runtime_v2.py",
-      "bytes": 24095,
-      "sha256": "ea1bc0667e3be83c0ee33cac366956aab8c11f7f3d4caa09283a329d839ddbce"
+      "bytes": 24098,
+      "sha256": "def7403b076aa76703b41adacef6539d5c1f29c3dc62c1f0f05f53f6c9515b61"
+    },
+    {
+      "path": "tests/test_skill_lifecycle.py",
+      "bytes": 10994,
+      "sha256": "101ee41926d7a092ac64543c47512a93f70887aa81e08c8ac941399d8b0e3a34"
     },
     {
       "path": "tests/test_task_api.py",
-      "bytes": 1801,
-      "sha256": "8813b0f671fd8d8203e4a0bac22abbc04b667b0787abfe0ac4fe1f70d93b29c2"
+      "bytes": 3458,
+      "sha256": "4adb4b5fdbe33468103bef79d641201369d7e1bc9a3e5cb536a759fea82b3f5d"
     },
     {
       "path": "THIRD_PARTY_NOTICES.md",
@@ -429,7 +454,7 @@
     {
       "path": "uv.lock",
       "bytes": 814862,
-      "sha256": "c2c56d606f565fff1e6bcad0cef135f986a4b51f5c0a90991e006d90da72b24d"
+      "sha256": "d9872ff3fbf51a9bcabf0842d9f6c838ccd05f5bc16a80a25b6088c4a1f4eb35"
     }
   ],
   "scope": "Allowlisted source; runtime data and third-party assets excluded"

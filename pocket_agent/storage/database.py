@@ -88,6 +88,18 @@ class Database:
                         );
                     """)
                     conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(2, ?)", (now_ms(),))
+                if 3 not in applied:
+                    conn.executescript("""
+                        CREATE TABLE IF NOT EXISTS skill_acquisitions (
+                            run_id TEXT PRIMARY KEY REFERENCES runs(id),
+                            fingerprint TEXT NOT NULL, state TEXT NOT NULL,
+                            candidate_id TEXT NOT NULL DEFAULT '',
+                            decision_json TEXT NOT NULL DEFAULT '{}', updated_at INTEGER NOT NULL
+                        );
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_acquisition_claim
+                            ON skill_acquisitions(fingerprint) WHERE state IN ('pending', 'completed');
+                    """)
+                    conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(3, ?)", (now_ms(),))
                 self._ensure_memory_fts(conn)
                 self._import_legacy_memories(conn)
 
